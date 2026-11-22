@@ -123,12 +123,13 @@ pub fn search_repos(client: &Client, query: &str) -> Result<Vec<RepoSummary>, St
     }
 
     // Filter to Lua repos first (WoW addons are Lua) without requiring literal "wow addon" words.
-    let lua_results = run_search(client, &format!("{trimmed} language:Lua"))?;
+    // Include forks (`fork:true`) since many maintained WoW addons are community/personal forks.
+    let lua_results = run_search(client, &format!("{trimmed} language:Lua fork:true"))?;
     if !lua_results.is_empty() {
         return Ok(lua_results);
     }
 
-    run_search(client, trimmed)
+    run_search(client, &format!("{trimmed} fork:true"))
 }
 
 #[derive(Debug, Deserialize)]

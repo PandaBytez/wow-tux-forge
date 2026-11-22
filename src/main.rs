@@ -150,6 +150,9 @@ impl App {
                 app.state.addons.len(),
                 app.local_addons.len()
             );
+            if app.local_addons.iter().any(|l| l.github_hint.is_some()) {
+                app.spawn_link_local_addons();
+            }
         }
         app
     }
@@ -742,6 +745,9 @@ impl App {
                                     "Saved AddOns path ({} local folder(s) found).",
                                     self.local_addons.len()
                                 );
+                                if self.local_addons.iter().any(|l| l.github_hint.is_some()) {
+                                    self.spawn_link_local_addons();
+                                }
                             }
                             Err(e) => self.status = e,
                         }
