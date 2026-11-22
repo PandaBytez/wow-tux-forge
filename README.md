@@ -9,13 +9,21 @@ Terminal UI (TUI) manager for World of Warcraft addons hosted on GitHub.
 - **Local addon linking:** Scan existing local addons and link them to their GitHub repos via `.toc` metadata.
 - **Security audit:** Inspect downloaded archives and installed addon folders for executables and suspicious Lua patterns.
 
-## Build & Run
+## Install
+
+### Homebrew (Recommended)
 
 ```bash
-cargo run --release
+brew tap pandabytez/tap && brew trust pandabytez/tap && brew install wow-tux-forge
 ```
 
-On first launch, press `c` to set your WoW `Interface/AddOns` directory path.
+### Cargo
+
+```bash
+cargo install --git https://github.com/PandaBytez/wow-tux-forge
+```
+
+Run `wow-tux-forge` and press `c` on first launch to set your WoW `Interface/AddOns` directory path.
 
 ## Keybindings
 
