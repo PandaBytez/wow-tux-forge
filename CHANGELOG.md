@@ -1,7 +1,11 @@
 # Changelog
 
-## v0.1.2 (2026-11-22)
+## v0.1.3 (2026-11-22)
 
+- Keep addon folder name when multi-flavor TOCs lack bare Addon.toc (63ec615)
+- Match versioned flavor asset names (e.g. -forever.zip) during Update All (fb31fc9)
+
+## v0.1.2 (2026-11-22)
 - Update README with latest features and keybindings (be27e95)
 - Add [p] pin/unpin version to skip update checks and Update All (0cb77a2)
 - Show all available releases in install picker instead of only latest (561a96b)
@@ -11,7 +15,6 @@
 - Use gh auth token fallback and clarify 403 rate-limit errors (952cd63)
 - Show interactive audit modal with accept-risk option when install/update is flagged (5a43856)
 - Backfill installed_at from addon folder mtime (c50749d)
-
 ## v0.1.1 (2026-11-22)
 - Remove manual [r] update check keybinding (53b341a)
 - Check for addon updates automatically on launch (dae562c)
