@@ -7,10 +7,11 @@ Terminal UI (TUI) manager for World of Warcraft addons hosted on GitHub.
 
 ## Features
 
-- **GitHub-native:** Search repositories and install release `.zip` assets directly into your `Interface/AddOns` directory.
-- **Updates:** Check for new releases and update all managed addons in one step.
-- **Local addon linking:** Scan existing local addons and link them to their GitHub repos via `.toc` metadata.
-- **Security audit:** Inspect downloaded archives and installed addon folders for executables and suspicious Lua patterns.
+- **GitHub-native:** Search repositories (including forks), pick from available release `.zip` versions, and install directly into `Interface/AddOns`.
+- **Automatic updates & pinning:** Checks for updates on launch (cached once per hour), updates only outdated addons with `u`, and lets you pin versions with `p`.
+- **Local addon linking:** Automatically scans existing local addons on launch and links them to GitHub via `.toc` metadata.
+- **Interactive security audit:** Blocks executables, flags suspicious Lua patterns before extraction, and lets you inspect flagged code snippets (`Enter`) or accept/cancel the install.
+- **Rate-limit friendly:** Uses `GITHUB_TOKEN` or `gh auth token` automatically when available.
 
 ## Install
 
@@ -38,7 +39,7 @@ Run `wow-tux-forge` and press `c` on first launch to set your WoW `Interface/Add
 | `u` | Update all outdated addons (Installed) |
 | `l` | Link local addons from `.toc` GitHub URLs (Installed) |
 | `a` | Security audit all addons (Installed) |
-| `s` | Security audit selected addon (Installed) |
+| `s` | Rescan local `AddOns` folder (Installed) |
 | `p` | Pin/unpin selected addon version (Installed) |
 | `d` | Delete selected addon (Installed) |
 | `Enter` / `i` | Install/reinstall selected addon (Search) or confirm |
