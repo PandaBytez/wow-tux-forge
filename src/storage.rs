@@ -21,6 +21,10 @@ pub struct InstalledAddon {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct State {
     pub addons: BTreeMap<String, InstalledAddon>,
+    #[serde(default)]
+    pub last_check_at: Option<u64>,
+    #[serde(default)]
+    pub cached_latest_tags: BTreeMap<String, String>,
 }
 
 pub fn config_path() -> PathBuf {

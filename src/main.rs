@@ -135,6 +135,12 @@ impl App {
             installed_list_state.select(Some(0));
         }
 
+        let latest_tags: BTreeMap<String, Result<String, String>> = state
+            .cached_latest_tags
+            .iter()
+            .map(|(k, v)| (k.clone(), Ok(v.clone())))
+            .collect();
+
         let status = if needs_path {
             "Set your WoW Interface/AddOns path to get started.".to_string()
         } else {
@@ -146,7 +152,7 @@ impl App {
             state,
             tab: Tab::Installed,
             installed_list_state,
-            latest_tags: BTreeMap::new(),
+            latest_tags,
             local_addons: Vec::new(),
             search_query: String::new(),
             search_focus: SearchFocus::Input,
@@ -340,6 +346,18 @@ impl App {
     fn spawn_check_updates(&mut self) {
         if self.busy || self.state.addons.is_empty() {
             return;
+        }
+        const CHECK_COOLDOWN_SECS: u64 = 3600;
+        if let Some(last) = self.state.last_check_at {
+            let elapsed = now_unix_secs().saturating_sub(last);
+            if elapsed < CHECK_COOLDOWN_SECS {
+                let mins_left = (CHECK_COOLDOWN_SECS - elapsed).div_ceil(60);
+                self.status = format!(
+                    "Update check skipped: checked {}m ago (limit: once per hour, next in {mins_left}m).",
+                    elapsed / 60
+                );
+                return;
+            }
         }
         let repos = self.installed_keys();
         self.busy = true;
@@ -569,6 +587,7 @@ impl App {
 
         if self.state.addons.remove(&confirm.label).is_some() {
             self.latest_tags.remove(&confirm.label);
+            self.state.cached_latest_tags.remove(&confirm.label);
             if let Err(e) = storage::save_state(&self.state) {
                 self.status = e;
                 return;
@@ -680,6 +699,9 @@ impl App {
                 let installed_count = installed.len();
                 let mut last_key = None;
                 for (key, entry) in installed {
+                    self.state
+                        .cached_latest_tags
+                        .insert(key.clone(), entry.tag.clone());
                     self.latest_tags.insert(key.clone(), Ok(entry.tag.clone()));
                     self.state.addons.insert(key.clone(), entry);
                     last_key = Some(key);
@@ -710,20 +732,29 @@ impl App {
             }
             BgResult::CheckUpdatesDone(results) => {
                 let mut updates = 0usize;
+                let mut any_ok = false;
                 for (repo, res) in results {
                     match res {
                         Ok(rel) => {
+                            any_ok = true;
                             if let Some(cur) = self.state.addons.get(&repo)
                                 && rel.tag_name != cur.tag
                             {
                                 updates += 1;
                             }
+                            self.state
+                                .cached_latest_tags
+                                .insert(repo.clone(), rel.tag_name.clone());
                             self.latest_tags.insert(repo, Ok(rel.tag_name));
                         }
                         Err(e) => {
                             self.latest_tags.insert(repo, Err(e));
                         }
                     }
+                }
+                if any_ok {
+                    self.state.last_check_at = Some(now_unix_secs());
+                    let _ = storage::save_state(&self.state);
                 }
                 self.status = format!("Check complete: {updates} update(s) available.");
             }
@@ -735,6 +766,9 @@ impl App {
             } => {
                 let updated_count = updated.len();
                 for (repo, entry) in updated {
+                    self.state
+                        .cached_latest_tags
+                        .insert(repo.clone(), entry.tag.clone());
                     self.latest_tags.insert(repo.clone(), Ok(entry.tag.clone()));
                     self.state.addons.insert(repo, entry);
                 }
