@@ -46,7 +46,7 @@ if ! git diff --quiet || [ -n "$(git status --porcelain)" ]; then
   git commit -m "Release ${TAG}"
 fi
 
-git push origin master
+git push origin main
 
 if ! git rev-parse "$TAG" >/dev/null 2>&1; then
   git tag -a "$TAG" -m "Release ${TAG}"
