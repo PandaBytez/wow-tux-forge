@@ -68,10 +68,17 @@ struct AssetPicker {
     state: ListState,
 }
 
+struct SnippetPreview {
+    title: String,
+    target_line: usize,
+    lines: Vec<(usize, String)>,
+}
+
 struct AuditModal {
     title: String,
     report: security::AuditReport,
     state: ListState,
+    snippet: Option<SnippetPreview>,
 }
 
 struct ConfirmDelete {
@@ -725,6 +732,7 @@ impl App {
                     title: format!("{folder_count} folder(s)"),
                     report,
                     state,
+                    snippet: None,
                 });
             }
         }
@@ -792,9 +800,30 @@ impl App {
         }
 
         if let Some(modal) = &mut self.audit_modal {
+            if modal.snippet.is_some() {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                    modal.snippet = None;
+                }
+                return;
+            }
             match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                KeyCode::Esc | KeyCode::Char('q') => {
                     self.audit_modal = None;
+                }
+                KeyCode::Enter => {
+                    if modal.report.findings.is_empty() {
+                        self.audit_modal = None;
+                    } else if let Some(idx) = modal.state.selected()
+                        && let Some(finding) = modal.report.findings.get(idx)
+                    {
+                        match load_finding_snippet(
+                            Path::new(&self.config.addons_path),
+                            &finding.location,
+                        ) {
+                            Ok(snip) => modal.snippet = Some(snip),
+                            Err(e) => self.status = e,
+                        }
+                    }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     let len = modal.report.findings.len();
@@ -996,6 +1025,35 @@ impl App {
             },
         }
     }
+}
+
+fn load_finding_snippet(addons_dir: &Path, location: &str) -> Result<SnippetPreview, String> {
+    let Some((rel, line_str)) = location.rsplit_once(':') else {
+        return Err(format!("No line number available for {location}"));
+    };
+    let target_line: usize = line_str
+        .parse()
+        .map_err(|_| format!("Invalid line number in {location}"))?;
+    let file = std::fs::File::open(addons_dir.join(rel))
+        .map_err(|e| format!("Failed opening {rel}: {e}"))?;
+    let reader = io::BufReader::new(file);
+    let start = target_line.saturating_sub(6).max(1);
+    let end = target_line + 6;
+    let mut lines = Vec::new();
+    for (idx, line_res) in io::BufRead::lines(reader).enumerate() {
+        let num = idx + 1;
+        if num > end {
+            break;
+        }
+        if num >= start {
+            lines.push((num, line_res.unwrap_or_default()));
+        }
+    }
+    Ok(SnippetPreview {
+        title: location.to_string(),
+        target_line,
+        lines,
+    })
 }
 
 fn cache_temp_zip(kind: &str) -> std::path::PathBuf {
@@ -1584,7 +1642,42 @@ fn draw(f: &mut Frame, app: &mut App) {
         let area = centered_rect(84, height, f.area());
         f.render_widget(Clear, area);
 
-        if modal.report.findings.is_empty() {
+        if let Some(snip) = &modal.snippet {
+            let snip_h = (snip.lines.len() as u16 + 2).clamp(6, 20);
+            let snip_area = centered_rect(86, snip_h, f.area());
+            f.render_widget(Clear, snip_area);
+            let text_lines: Vec<Line> = snip
+                .lines
+                .iter()
+                .map(|(n, line)| {
+                    let is_target = *n == snip.target_line;
+                    let prefix = if is_target { "▶ " } else { "  " };
+                    let num_style = Style::default().fg(if is_target { Color::Red } else { dim });
+                    let code_style = if is_target {
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    Line::from(vec![
+                        Span::styled(format!("{prefix}{n:>4} | "), num_style),
+                        Span::styled(line.as_str(), code_style),
+                    ])
+                })
+                .collect();
+            let p = Paragraph::new(text_lines)
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(gold))
+                        .title(Span::styled(
+                            format!(" {} ([Esc/Enter] Back) ", snip.title),
+                            Style::default().fg(gold).add_modifier(Modifier::BOLD),
+                        )),
+                );
+            f.render_widget(p, snip_area);
+        } else if modal.report.findings.is_empty() {
             let p = Paragraph::new(Line::from(Span::styled(
                 "✓ Threat: NONE — no executables, obfuscated Lua, or sensitive mail/trade/gold calls found.",
                 Style::default().fg(emerald),
@@ -1639,7 +1732,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                         .border_style(Style::default().fg(border_col))
                         .title(Span::styled(
                             format!(
-                                " Security Audit: {} | Threat: {threat_label} ({count} finding(s) — [Esc/Enter] Close) ",
+                                " Security Audit: {} | Threat: {threat_label} ({count} finding(s) — [Enter] View Code, [Esc] Close) ",
                                 modal.title
                             ),
                             Style::default().fg(border_col).add_modifier(Modifier::BOLD),
@@ -1776,7 +1869,9 @@ fn relative_time_ago_from(iso: &str, now_secs: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{install_state_key, move_selection, relative_time_ago_from, wrap_text};
+    use super::{
+        install_state_key, load_finding_snippet, move_selection, relative_time_ago_from, wrap_text,
+    };
 
     #[test]
     fn formats_relative_time_ago() {
@@ -1800,5 +1895,25 @@ mod tests {
         assert_eq!(move_selection(None, 3, 1), Some(0));
         assert_eq!(move_selection(Some(2), 3, 1), Some(2));
         assert_eq!(move_selection(Some(0), 3, -1), Some(0));
+    }
+
+    #[test]
+    fn loads_finding_snippet_with_context() {
+        let tmp = std::env::temp_dir().join(format!("wow-tux-forge-snip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("MyAddon")).unwrap();
+        let content = (1..=15)
+            .map(|i| format!("local line_{i} = {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(tmp.join("MyAddon/Core.lua"), content).unwrap();
+
+        let snip = load_finding_snippet(&tmp, "MyAddon/Core.lua:10").unwrap();
+        assert_eq!(snip.target_line, 10);
+        assert_eq!(snip.lines.first().unwrap().0, 4);
+        assert_eq!(snip.lines.last().unwrap().0, 15);
+        assert!(load_finding_snippet(&tmp, "MyAddon/payload.exe").is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
