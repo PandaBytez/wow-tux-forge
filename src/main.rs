@@ -15,7 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table,
-    TableState, Tabs,
+    TableState, Tabs, Wrap,
 };
 use ratatui::{Frame, Terminal};
 use std::collections::{BTreeMap, HashSet};
@@ -1148,8 +1148,22 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else {
         &app.config.addons_path
     };
+    let inner_w = header_chunks[1].width.saturating_sub(2) as usize;
+    let path_display = if inner_w > 1 && path_label.chars().count() > inner_w {
+        let tail: String = path_label
+            .chars()
+            .rev()
+            .take(inner_w - 1)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("…{tail}")
+    } else {
+        path_label.to_string()
+    };
     let path_box = Paragraph::new(Line::from(Span::styled(
-        path_label,
+        path_display,
         Style::default().fg(if app.config.addons_path.is_empty() {
             Color::Red
         } else {
@@ -1401,9 +1415,10 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Path editor modal
     if app.editing_path {
-        let area = centered_rect(75, 5, f.area());
+        let area = centered_rect(75, 6, f.area());
         f.render_widget(Clear, area);
         let p = Paragraph::new(app.path_input.as_str())
+            .wrap(Wrap { trim: false })
             .style(Style::default().fg(Color::White))
             .block(
                 Block::default()
