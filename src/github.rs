@@ -1,0 +1,387 @@
+use reqwest::blocking::Client;
+use reqwest::header::{ACCEPT, USER_AGENT};
+use serde::Deserialize;
+use std::time::Duration;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RepoSummary {
+    pub full_name: String,
+    pub stargazers_count: u64,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchResponse {
+    items: Vec<RepoSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReleaseAsset {
+    pub name: String,
+    pub browser_download_url: String,
+    pub size: u64,
+    pub download_count: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Release {
+    pub tag_name: String,
+    #[serde(default)]
+    pub draft: bool,
+    pub assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReleaseOption {
+    pub tag_name: String,
+    pub asset: ReleaseAsset,
+}
+
+pub fn make_client() -> Result<Client, String> {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(None)
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn parse_owner_repo(input: &str) -> Option<String> {
+    let trimmed = input.trim().trim_end_matches('/');
+    let path = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))
+        .unwrap_or(trimmed);
+
+    if path.contains(' ') {
+        return None;
+    }
+    let mut parts = path.split('/').filter(|s| !s.is_empty());
+    let owner = parts.next()?;
+    let raw_repo = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let repo = raw_repo.strip_suffix(".git").unwrap_or(raw_repo);
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+fn run_search(client: &Client, raw_query: &str) -> Result<Vec<RepoSummary>, String> {
+    let q = percent_encode(raw_query);
+    let url = format!("https://api.github.com/search/repositories?q={q}&per_page=25");
+    let resp = client
+        .get(&url)
+        .header(USER_AGENT, "wow-tux-forge/0.1")
+        .header(ACCEPT, "application/vnd.github+json")
+        .send()
+        .map_err(|e| format!("Search failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("GitHub search returned {}", resp.status()));
+    }
+
+    let parsed: SearchResponse = resp.json().map_err(|e| format!("Invalid JSON: {e}"))?;
+    Ok(parsed.items)
+}
+
+pub fn search_repos(client: &Client, query: &str) -> Result<Vec<RepoSummary>, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Direct owner/repo or https://github.com/owner/repo lookup.
+    if let Some(slug) = parse_owner_repo(trimmed) {
+        let url = format!("https://api.github.com/repos/{slug}");
+        let resp = client
+            .get(&url)
+            .header(USER_AGENT, "wow-tux-forge/0.1")
+            .header(ACCEPT, "application/vnd.github+json")
+            .send()
+            .map_err(|e| format!("Request failed: {e}"))?;
+
+        if resp.status().is_success() {
+            let repo: RepoSummary = resp.json().map_err(|e| format!("Invalid JSON: {e}"))?;
+            return Ok(vec![repo]);
+        }
+    }
+
+    // Filter to Lua repos first (WoW addons are Lua) without requiring literal "wow addon" words.
+    let lua_results = run_search(client, &format!("{trimmed} language:Lua"))?;
+    if !lua_results.is_empty() {
+        return Ok(lua_results);
+    }
+
+    run_search(client, trimmed)
+}
+
+#[derive(Debug, Deserialize)]
+struct TagItem {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepoMeta {
+    default_branch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitItem {
+    sha: String,
+}
+
+fn fallback_archive_release(client: &Client, repo: &str) -> Result<Release, String> {
+    let repo_name = repo.split('/').nth(1).unwrap_or(repo);
+
+    // 1. Prefer latest git tag if the repo uses tags without GitHub Releases.
+    let tags_url = format!("https://api.github.com/repos/{repo}/tags?per_page=1");
+    if let Ok(resp) = client
+        .get(&tags_url)
+        .header(USER_AGENT, "wow-tux-forge/0.1")
+        .header(ACCEPT, "application/vnd.github+json")
+        .send()
+        && resp.status().is_success()
+        && let Ok(tags) = resp.json::<Vec<TagItem>>()
+        && let Some(tag) = tags.into_iter().next()
+    {
+        return Ok(Release {
+            tag_name: tag.name.clone(),
+            draft: false,
+            assets: vec![ReleaseAsset {
+                name: format!("{repo_name}-{}.zip", tag.name),
+                browser_download_url: format!(
+                    "https://api.github.com/repos/{repo}/zipball/{}",
+                    percent_encode(&tag.name)
+                ),
+                size: 0,
+                download_count: 0,
+            }],
+        });
+    }
+
+    // 2. Fall back to default branch latest commit zipball.
+    let meta_url = format!("https://api.github.com/repos/{repo}");
+    let meta_resp = client
+        .get(&meta_url)
+        .header(USER_AGENT, "wow-tux-forge/0.1")
+        .header(ACCEPT, "application/vnd.github+json")
+        .send()
+        .map_err(|e| format!("Failed fetching repo info for {repo}: {e}"))?;
+    if !meta_resp.status().is_success() {
+        return Err(format!("GitHub returned {} for {repo}", meta_resp.status()));
+    }
+    let meta: RepoMeta = meta_resp
+        .json()
+        .map_err(|e| format!("Invalid repo JSON: {e}"))?;
+
+    let commits_url = format!(
+        "https://api.github.com/repos/{repo}/commits?sha={}&per_page=1",
+        percent_encode(&meta.default_branch)
+    );
+    let short_sha = client
+        .get(&commits_url)
+        .header(USER_AGENT, "wow-tux-forge/0.1")
+        .header(ACCEPT, "application/vnd.github+json")
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| r.json::<Vec<CommitItem>>().ok())
+        .and_then(|c| c.into_iter().next())
+        .map(|c| c.sha.chars().take(7).collect::<String>())
+        .unwrap_or_else(|| "head".to_string());
+
+    Ok(Release {
+        tag_name: format!("{}@{short_sha}", meta.default_branch),
+        draft: false,
+        assets: vec![ReleaseAsset {
+            name: format!("{repo_name}-{}.zip", meta.default_branch),
+            browser_download_url: format!(
+                "https://api.github.com/repos/{repo}/zipball/{}",
+                percent_encode(&meta.default_branch)
+            ),
+            size: 0,
+            download_count: 0,
+        }],
+    })
+}
+
+fn fetch_releases_list(client: &Client, repo: &str) -> Result<Vec<Release>, String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=50");
+    let resp = client
+        .get(&url)
+        .header(USER_AGENT, "wow-tux-forge/0.1")
+        .header(ACCEPT, "application/vnd.github+json")
+        .send()
+        .map_err(|e| format!("Release list failed for {repo}: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("GitHub returned {} for {repo}", resp.status()));
+    }
+
+    let mut releases: Vec<Release> = resp.json().map_err(|e| format!("Invalid JSON: {e}"))?;
+    for r in &mut releases {
+        r.assets
+            .retain(|a| a.name.to_ascii_lowercase().ends_with(".zip"));
+    }
+    releases.retain(|r| !r.draft && !r.assets.is_empty());
+    Ok(releases)
+}
+
+pub fn fetch_install_options(client: &Client, repo: &str) -> Result<Vec<ReleaseOption>, String> {
+    if let Ok(releases) = fetch_releases_list(client, repo)
+        && !releases.is_empty()
+    {
+        let has_prefixed = releases.iter().any(|r| r.tag_name.contains('/'));
+        if has_prefixed {
+            let mut seen_prefixes = std::collections::HashSet::new();
+            let mut options = Vec::new();
+            for r in releases {
+                let prefix = r
+                    .tag_name
+                    .split('/')
+                    .next()
+                    .unwrap_or(&r.tag_name)
+                    .to_string();
+                if seen_prefixes.insert(prefix) {
+                    for asset in r.assets {
+                        options.push(ReleaseOption {
+                            tag_name: r.tag_name.clone(),
+                            asset,
+                        });
+                    }
+                }
+            }
+            if !options.is_empty() {
+                return Ok(options);
+            }
+        } else {
+            let first = releases.into_iter().next().unwrap();
+            return Ok(first
+                .assets
+                .into_iter()
+                .map(|asset| ReleaseOption {
+                    tag_name: first.tag_name.clone(),
+                    asset,
+                })
+                .collect());
+        }
+    }
+
+    let rel = latest_release(client, repo)?;
+    Ok(rel
+        .assets
+        .into_iter()
+        .map(|asset| ReleaseOption {
+            tag_name: rel.tag_name.clone(),
+            asset,
+        })
+        .collect())
+}
+
+pub fn latest_release_for_key(client: &Client, state_key: &str) -> Result<Release, String> {
+    if let Some((repo, prefix)) = state_key.split_once('#') {
+        let releases = fetch_releases_list(client, repo)?;
+        let prefix_slash = format!("{prefix}/");
+        return releases
+            .into_iter()
+            .find(|r| r.tag_name.starts_with(&prefix_slash))
+            .ok_or_else(|| format!("No release found for {state_key}"));
+    }
+    latest_release(client, state_key)
+}
+
+pub fn latest_release(client: &Client, repo: &str) -> Result<Release, String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let resp = client
+        .get(&url)
+        .header(USER_AGENT, "wow-tux-forge/0.1")
+        .header(ACCEPT, "application/vnd.github+json")
+        .send()
+        .map_err(|e| format!("Release check failed for {repo}: {e}"))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return fallback_archive_release(client, repo);
+    }
+    if !resp.status().is_success() {
+        return Err(format!("GitHub returned {} for {repo}", resp.status()));
+    }
+
+    let mut release: Release = resp.json().map_err(|e| format!("Invalid JSON: {e}"))?;
+    release
+        .assets
+        .retain(|a| a.name.to_ascii_lowercase().ends_with(".zip"));
+
+    if release.assets.is_empty() {
+        return fallback_archive_release(client, repo);
+    }
+    Ok(release)
+}
+
+pub fn download_to_file(client: &Client, url: &str, dest: &std::path::Path) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        let mut resp = match client
+            .get(url)
+            .header(USER_AGENT, "wow-tux-forge/0.1")
+            .send()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("Download failed: {e}");
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            return Err(format!("Download returned {}", resp.status()));
+        }
+
+        let mut out = std::fs::File::create(dest)
+            .map_err(|e| format!("Failed creating temp file {}: {e}", dest.display()))?;
+        match std::io::copy(&mut resp, &mut out) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = format!("Failed reading download body: {e}");
+                let _ = std::fs::remove_file(dest);
+            }
+        }
+    }
+    Err(last_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_owner_repo;
+
+    #[test]
+    fn parses_slug_and_urls() {
+        assert_eq!(
+            parse_owner_repo("https://github.com/Wuild/GatherLite").as_deref(),
+            Some("Wuild/GatherLite")
+        );
+        assert_eq!(
+            parse_owner_repo("Wuild/GatherLite.git").as_deref(),
+            Some("Wuild/GatherLite")
+        );
+        assert_eq!(parse_owner_repo("GatherLite"), None);
+    }
+}

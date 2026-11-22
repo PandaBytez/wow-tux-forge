@@ -1,0 +1,1618 @@
+mod addon;
+mod github;
+mod security;
+mod storage;
+
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use github::{Release, ReleaseAsset, ReleaseOption, RepoSummary};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table,
+    TableState, Tabs,
+};
+use ratatui::{Frame, Terminal};
+use std::collections::{BTreeMap, HashSet};
+use std::io;
+use std::path::Path;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::Duration;
+use storage::{Config, InstalledAddon, State};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Installed,
+    Search,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchFocus {
+    Input,
+    Results,
+}
+
+enum BgResult {
+    SearchDone(Result<Vec<RepoSummary>, String>),
+    ReleaseForInstall(String, Result<Vec<ReleaseOption>, String>),
+    InstallBatchDone {
+        installed: Vec<(String, InstalledAddon)>,
+        errors: Vec<String>,
+    },
+    CheckUpdatesDone(Vec<(String, Result<Release, String>)>),
+    UpdateAllDone {
+        updated: Vec<(String, InstalledAddon)>,
+        errors: Vec<String>,
+        up_to_date_count: usize,
+    },
+    LinkLocalDone {
+        linked: Vec<(String, InstalledAddon)>,
+        failed: usize,
+    },
+    AuditDone {
+        folder_count: usize,
+        report: security::AuditReport,
+    },
+}
+
+struct AssetPicker {
+    repo: String,
+    options: Vec<ReleaseOption>,
+    selected: Vec<bool>,
+    state: ListState,
+}
+
+struct AuditModal {
+    title: String,
+    report: security::AuditReport,
+    state: ListState,
+}
+
+struct ConfirmDelete {
+    label: String,
+    folders: Vec<String>,
+}
+
+struct App {
+    config: Config,
+    state: State,
+    tab: Tab,
+    installed_list_state: TableState,
+    latest_tags: BTreeMap<String, Result<String, String>>,
+    local_addons: Vec<addon::LocalAddon>,
+
+    search_query: String,
+    search_focus: SearchFocus,
+    search_results: Vec<RepoSummary>,
+    search_list_state: TableState,
+
+    editing_path: bool,
+    path_input: String,
+    asset_picker: Option<AssetPicker>,
+    audit_modal: Option<AuditModal>,
+    confirm_delete: Option<ConfirmDelete>,
+
+    status: String,
+    busy: bool,
+    rx: Option<Receiver<BgResult>>,
+    should_quit: bool,
+}
+
+impl App {
+    fn new() -> Self {
+        let config = storage::load_config();
+        let state = storage::load_state();
+        let needs_path = config.addons_path.trim().is_empty();
+        let path_input = config.addons_path.clone();
+
+        let mut installed_list_state = TableState::default();
+        if !state.addons.is_empty() {
+            installed_list_state.select(Some(0));
+        }
+
+        let status = if needs_path {
+            "Set your WoW Interface/AddOns path to get started.".to_string()
+        } else {
+            format!("Loaded {} installed addon(s).", state.addons.len())
+        };
+
+        let mut app = Self {
+            config,
+            state,
+            tab: Tab::Installed,
+            installed_list_state,
+            latest_tags: BTreeMap::new(),
+            local_addons: Vec::new(),
+            search_query: String::new(),
+            search_focus: SearchFocus::Input,
+            search_results: Vec::new(),
+            search_list_state: TableState::default(),
+            editing_path: needs_path,
+            path_input,
+            asset_picker: None,
+            audit_modal: None,
+            confirm_delete: None,
+            status,
+            busy: false,
+            rx: None,
+            should_quit: false,
+        };
+        app.refresh_local_addons();
+        if !needs_path {
+            app.status = format!(
+                "Loaded {} GitHub addon(s), {} local addon folder(s).",
+                app.state.addons.len(),
+                app.local_addons.len()
+            );
+        }
+        app
+    }
+
+    fn refresh_local_addons(&mut self) {
+        let managed: HashSet<String> = self
+            .state
+            .addons
+            .values()
+            .flat_map(|a| a.folders.iter().cloned())
+            .collect();
+        self.local_addons = addon::scan_unmanaged_addons(Path::new(&self.config.addons_path), &managed);
+        let total = self.installed_total_len();
+        if total == 0 {
+            self.installed_list_state.select(None);
+        } else if self.installed_list_state.selected().is_none() {
+            self.installed_list_state.select(Some(0));
+        } else if let Some(sel) = self.installed_list_state.selected()
+            && sel >= total
+        {
+            self.installed_list_state.select(Some(total - 1));
+        }
+    }
+
+    fn installed_total_len(&self) -> usize {
+        self.state.addons.len() + self.local_addons.len()
+    }
+
+    fn installed_keys(&self) -> Vec<String> {
+        self.state.addons.keys().cloned().collect()
+    }
+
+    fn spawn_search(&mut self) {
+        let query = self.search_query.trim().to_string();
+        if query.is_empty() || self.busy {
+            return;
+        }
+        self.busy = true;
+        self.status = format!("Searching GitHub for \"{query}\"...");
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        thread::spawn(move || {
+            let res = github::make_client().and_then(|c| github::search_repos(&c, &query));
+            let _ = tx.send(BgResult::SearchDone(res));
+        });
+    }
+
+    fn spawn_fetch_release(&mut self, repo: String) {
+        if self.busy {
+            return;
+        }
+        if !Path::new(&self.config.addons_path).is_dir() {
+            self.status = "Invalid WoW AddOns path. Press 'c' to configure it.".to_string();
+            return;
+        }
+        self.busy = true;
+        self.status = format!("Fetching releases for {repo}...");
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        thread::spawn(move || {
+            let res = github::make_client().and_then(|c| github::fetch_install_options(&c, &repo));
+            let _ = tx.send(BgResult::ReleaseForInstall(repo, res));
+        });
+    }
+
+    fn spawn_install_batch(&mut self, items: Vec<(String, String, ReleaseAsset)>) {
+        if self.busy || items.is_empty() {
+            return;
+        }
+        let addons_dir = self.config.addons_path.clone();
+        let existing_folders: Vec<Vec<String>> = items
+            .iter()
+            .map(|(key, _, _)| {
+                self.state
+                    .addons
+                    .get(key)
+                    .map(|a| a.folders.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        self.busy = true;
+        if items.len() == 1 {
+            let (key, _, asset) = &items[0];
+            self.status = format!(
+                "Downloading {key} ({}, {} downloads)...",
+                asset.name, asset.download_count
+            );
+        } else {
+            self.status = format!("Downloading and installing {} package(s)...", items.len());
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+
+        thread::spawn(move || {
+            let mut installed = Vec::new();
+            let mut errors = Vec::new();
+
+            let client = match github::make_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(BgResult::InstallBatchDone {
+                        installed,
+                        errors: vec![e],
+                    });
+                    return;
+                }
+            };
+
+            let addons_path = Path::new(&addons_dir);
+            let tmp_zip = std::env::temp_dir().join(format!("wow-tux-forge-{}.zip", std::process::id()));
+            for ((state_key, tag, asset), old_folders) in items.into_iter().zip(existing_folders) {
+                let res = github::download_to_file(&client, &asset.browser_download_url, &tmp_zip)
+                    .and_then(|()| {
+                        let _report = security::audit_zip_file(&tmp_zip)?;
+                        if !old_folders.is_empty() {
+                            addon::remove_folders(addons_path, &old_folders)?;
+                        }
+                        let folders = addon::extract_addon_zip_file(&tmp_zip, addons_path)?;
+                        Ok(InstalledAddon {
+                            tag,
+                            asset_name: asset.name,
+                            folders,
+                        })
+                    });
+                let _ = std::fs::remove_file(&tmp_zip);
+                match res {
+                    Ok(entry) => installed.push((state_key, entry)),
+                    Err(e) => errors.push(format!("{state_key}: {e}")),
+                }
+            }
+
+            let _ = tx.send(BgResult::InstallBatchDone { installed, errors });
+        });
+    }
+
+    fn spawn_check_updates(&mut self) {
+        if self.busy || self.state.addons.is_empty() {
+            return;
+        }
+        let repos = self.installed_keys();
+        self.busy = true;
+        self.status = format!("Checking updates for {} addon(s)...", repos.len());
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+
+        thread::spawn(move || {
+            let results = match github::make_client() {
+                Ok(client) => repos
+                    .into_iter()
+                    .map(|repo| {
+                        let res = github::latest_release_for_key(&client, &repo);
+                        (repo, res)
+                    })
+                    .collect(),
+                Err(e) => repos.into_iter().map(|r| (r, Err(e.clone()))).collect(),
+            };
+            let _ = tx.send(BgResult::CheckUpdatesDone(results));
+        });
+    }
+
+    fn spawn_update_all(&mut self) {
+        if self.busy {
+            return;
+        }
+        if self.state.addons.is_empty() {
+            self.status = "No addons installed yet.".to_string();
+            return;
+        }
+        if !Path::new(&self.config.addons_path).is_dir() {
+            self.status = "Invalid WoW AddOns path. Press 'c' to configure it.".to_string();
+            return;
+        }
+
+        let addons_dir = self.config.addons_path.clone();
+        let tracked = self.state.addons.clone();
+        self.busy = true;
+        self.status = format!("Checking and updating {} addon(s)...", tracked.len());
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+
+        thread::spawn(move || {
+            let mut updated = Vec::new();
+            let mut errors = Vec::new();
+            let mut up_to_date_count = 0usize;
+
+            let client = match github::make_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(BgResult::UpdateAllDone {
+                        updated,
+                        errors: vec![e],
+                        up_to_date_count,
+                    });
+                    return;
+                }
+            };
+
+            let addons_path = Path::new(&addons_dir);
+            let tmp_zip = std::env::temp_dir().join(format!("wow-tux-forge-upd-{}.zip", std::process::id()));
+            for (repo, current) in tracked {
+                let release = match github::latest_release_for_key(&client, &repo) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        errors.push(format!("{repo}: {e}"));
+                        continue;
+                    }
+                };
+
+                if release.tag_name == current.tag {
+                    up_to_date_count += 1;
+                    continue;
+                }
+
+                let asset = release
+                    .assets
+                    .iter()
+                    .find(|a| a.name == current.asset_name)
+                    .or_else(|| release.assets.first())
+                    .cloned();
+
+                let Some(asset) = asset else {
+                    errors.push(format!("{repo}: no .zip asset in {}", release.tag_name));
+                    continue;
+                };
+
+                let res = github::download_to_file(&client, &asset.browser_download_url, &tmp_zip)
+                    .and_then(|()| {
+                        let _report = security::audit_zip_file(&tmp_zip)?;
+                        addon::remove_folders(addons_path, &current.folders)?;
+                        let folders = addon::extract_addon_zip_file(&tmp_zip, addons_path)?;
+                        Ok(InstalledAddon {
+                            tag: release.tag_name,
+                            asset_name: asset.name,
+                            folders,
+                        })
+                    });
+                let _ = std::fs::remove_file(&tmp_zip);
+                match res {
+                    Ok(new_entry) => updated.push((repo, new_entry)),
+                    Err(e) => errors.push(format!("{repo}: {e}")),
+                }
+            }
+
+            let _ = tx.send(BgResult::UpdateAllDone {
+                updated,
+                errors,
+                up_to_date_count,
+            });
+        });
+    }
+
+    fn spawn_link_local_addons(&mut self) {
+        if self.busy {
+            return;
+        }
+        let hinted: Vec<(String, Option<String>, String)> = self
+            .local_addons
+            .iter()
+            .filter_map(|l| {
+                l.github_hint
+                    .as_ref()
+                    .map(|repo| (l.folder.clone(), l.version.clone(), repo.clone()))
+            })
+            .collect();
+
+        if hinted.is_empty() {
+            self.status = "No local addons have GitHub URLs in their .toc. Press Enter on one to search.".to_string();
+            return;
+        }
+
+        self.busy = true;
+        self.status = format!("Linking {} local addon(s) via .toc GitHub URLs...", hinted.len());
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+
+        thread::spawn(move || {
+            let mut linked = Vec::new();
+            let mut failed = 0usize;
+
+            let Ok(client) = github::make_client() else {
+                let _ = tx.send(BgResult::LinkLocalDone {
+                    linked,
+                    failed: hinted.len(),
+                });
+                return;
+            };
+
+            // Group folders by repo in case multiple folders point to the same GitHub repo.
+            let mut by_repo: BTreeMap<String, (Vec<String>, Option<String>)> = BTreeMap::new();
+            for (folder, version, repo) in hinted {
+                let entry = by_repo.entry(repo).or_insert_with(|| (Vec::new(), version));
+                entry.0.push(folder);
+            }
+
+            for (repo, (folders, local_ver)) in by_repo {
+                match github::latest_release(&client, &repo) {
+                    Ok(rel) if !rel.assets.is_empty() => {
+                        let tag = local_ver.unwrap_or_else(|| "local".to_string());
+                        linked.push((
+                            repo,
+                            InstalledAddon {
+                                tag,
+                                asset_name: rel.assets[0].name.clone(),
+                                folders,
+                            },
+                        ));
+                    }
+                    _ => failed += 1,
+                }
+            }
+
+            let _ = tx.send(BgResult::LinkLocalDone { linked, failed });
+        });
+    }
+
+    fn prompt_delete_selected(&mut self) {
+        let Some(idx) = self.installed_list_state.selected() else {
+            return;
+        };
+        let managed_len = self.state.addons.len();
+        if idx < managed_len {
+            let Some(repo) = self.installed_keys().get(idx).cloned() else {
+                return;
+            };
+            let Some(entry) = self.state.addons.get(&repo) else {
+                return;
+            };
+            self.confirm_delete = Some(ConfirmDelete {
+                label: repo,
+                folders: entry.folders.clone(),
+            });
+        } else if let Some(local) = self.local_addons.get(idx - managed_len) {
+            self.confirm_delete = Some(ConfirmDelete {
+                label: local.folder.clone(),
+                folders: vec![local.folder.clone()],
+            });
+        }
+    }
+
+    fn execute_delete(&mut self, confirm: ConfirmDelete) {
+        let addons_path = Path::new(&self.config.addons_path);
+        if addons_path.is_dir()
+            && let Err(e) = addon::remove_folders(addons_path, &confirm.folders)
+        {
+            self.status = format!("Failed removing {}: {e}", confirm.label);
+            return;
+        }
+
+        if self.state.addons.remove(&confirm.label).is_some() {
+            self.latest_tags.remove(&confirm.label);
+            if let Err(e) = storage::save_state(&self.state) {
+                self.status = e;
+                return;
+            }
+        }
+
+        self.refresh_local_addons();
+        self.status = format!("Removed {}.", confirm.label);
+    }
+
+    fn spawn_audit_all(&mut self) {
+        if self.busy {
+            return;
+        }
+        let addons_path = Path::new(&self.config.addons_path);
+        if !addons_path.is_dir() {
+            self.status = "Invalid WoW AddOns path.".to_string();
+            return;
+        }
+
+        let mut folders_set = std::collections::BTreeSet::new();
+        for entry in self.state.addons.values() {
+            for f in &entry.folders {
+                folders_set.insert(f.clone());
+            }
+        }
+        for local in &self.local_addons {
+            folders_set.insert(local.folder.clone());
+        }
+        if folders_set.is_empty() {
+            self.status = "No installed addon folders to audit.".to_string();
+            return;
+        }
+
+        let folders: Vec<String> = folders_set.into_iter().collect();
+        let folder_count = folders.len();
+        let addons_dir = self.config.addons_path.clone();
+
+        self.busy = true;
+        self.status = format!("Auditing {folder_count} addon folder(s)...");
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+
+        thread::spawn(move || {
+            let report = security::audit_installed_folders(Path::new(&addons_dir), &folders);
+            let _ = tx.send(BgResult::AuditDone {
+                folder_count,
+                report,
+            });
+        });
+    }
+
+    fn poll_bg(&mut self) {
+        let Some(rx) = &self.rx else {
+            return;
+        };
+        let Ok(msg) = rx.try_recv() else {
+            return;
+        };
+        self.rx = None;
+        self.busy = false;
+
+        match msg {
+            BgResult::SearchDone(Ok(items)) => {
+                let count = items.len();
+                self.search_results = items;
+                if count > 0 {
+                    self.search_list_state.select(Some(0));
+                    self.search_focus = SearchFocus::Results;
+                } else {
+                    self.search_list_state.select(None);
+                }
+                self.status = format!("Found {count} repository result(s).");
+            }
+            BgResult::SearchDone(Err(e)) => {
+                self.status = format!("Search error: {e}");
+            }
+            BgResult::ReleaseForInstall(repo, Ok(options)) => {
+                if options.is_empty() {
+                    self.status = format!("{repo} has no .zip assets.");
+                } else if options.len() == 1 {
+                    let opt = options.into_iter().next().unwrap();
+                    let state_key = install_state_key(&repo, &opt.tag_name);
+                    self.spawn_install_batch(vec![(state_key, opt.tag_name, opt.asset)]);
+                } else {
+                    let mut state = ListState::default();
+                    state.select(Some(0));
+                    let selected = vec![false; options.len()];
+                    self.status = format!(
+                        "Select packages for {repo} ({} options): Space to toggle, Enter to install.",
+                        options.len()
+                    );
+                    self.asset_picker = Some(AssetPicker {
+                        repo,
+                        options,
+                        selected,
+                        state,
+                    });
+                }
+            }
+            BgResult::ReleaseForInstall(repo, Err(e)) => {
+                self.status = format!("{repo}: {e}");
+            }
+            BgResult::InstallBatchDone { installed, errors } => {
+                let installed_count = installed.len();
+                let mut last_key = None;
+                for (key, entry) in installed {
+                    self.latest_tags.insert(key.clone(), Ok(entry.tag.clone()));
+                    self.state.addons.insert(key.clone(), entry);
+                    last_key = Some(key);
+                }
+                if let Err(e) = storage::save_state(&self.state) {
+                    self.status = e;
+                } else {
+                    self.refresh_local_addons();
+                    if let Some(ref k) = last_key
+                        && let Some(idx) = self.installed_keys().iter().position(|x| x == k)
+                    {
+                        self.installed_list_state.select(Some(idx));
+                    }
+                    if errors.is_empty() {
+                        self.status = format!("Installed {installed_count} package(s).");
+                    } else {
+                        self.status = format!(
+                            "Installed {installed_count}, {} error(s): {}",
+                            errors.len(),
+                            errors[0]
+                        );
+                    }
+                }
+            }
+            BgResult::CheckUpdatesDone(results) => {
+                let mut updates = 0usize;
+                for (repo, res) in results {
+                    match res {
+                        Ok(rel) => {
+                            if let Some(cur) = self.state.addons.get(&repo)
+                                && rel.tag_name != cur.tag
+                            {
+                                updates += 1;
+                            }
+                            self.latest_tags.insert(repo, Ok(rel.tag_name));
+                        }
+                        Err(e) => {
+                            self.latest_tags.insert(repo, Err(e));
+                        }
+                    }
+                }
+                self.status = format!("Check complete: {updates} update(s) available.");
+            }
+            BgResult::UpdateAllDone {
+                updated,
+                errors,
+                up_to_date_count,
+            } => {
+                let updated_count = updated.len();
+                for (repo, entry) in updated {
+                    self.latest_tags.insert(repo.clone(), Ok(entry.tag.clone()));
+                    self.state.addons.insert(repo, entry);
+                }
+                self.refresh_local_addons();
+                let save_err = storage::save_state(&self.state).err();
+                if let Some(e) = save_err {
+                    self.status = e;
+                } else if errors.is_empty() {
+                    self.status = format!(
+                        "Updated {updated_count} addon(s), {up_to_date_count} already up to date."
+                    );
+                } else {
+                    self.status = format!(
+                        "Updated {updated_count}, up-to-date {up_to_date_count}, {} error(s): {}",
+                        errors.len(),
+                        errors[0]
+                    );
+                }
+            }
+            BgResult::LinkLocalDone { linked, failed } => {
+                let count = linked.len();
+                for (repo, entry) in linked {
+                    self.state.addons.insert(repo, entry);
+                }
+                self.refresh_local_addons();
+                if let Err(e) = storage::save_state(&self.state) {
+                    self.status = e;
+                } else {
+                    self.status = format!(
+                        "Linked {count} addon(s) to GitHub ({failed} had no GitHub release zips)."
+                    );
+                }
+            }
+            BgResult::AuditDone {
+                folder_count,
+                report,
+            } => {
+                let finding_count = report.findings.len();
+                let mut state = ListState::default();
+                if finding_count > 0 {
+                    state.select(Some(0));
+                }
+                self.status = if finding_count == 0 {
+                    format!("Security Report: {folder_count} folder(s) audited — Clean.")
+                } else {
+                    format!(
+                        "Security Report: {folder_count} folder(s) audited — {finding_count} finding(s)."
+                    )
+                };
+                self.audit_modal = Some(AuditModal {
+                    title: format!("{folder_count} folder(s)"),
+                    report,
+                    state,
+                });
+            }
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
+        if self.editing_path {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.config.addons_path.is_empty() {
+                        self.editing_path = false;
+                        self.path_input = self.config.addons_path.clone();
+                    }
+                }
+                KeyCode::Enter => {
+                    let trimmed = self.path_input.trim().to_string();
+                    if Path::new(&trimmed).is_dir() {
+                        self.config.addons_path = trimmed;
+                        match storage::save_config(&self.config) {
+                            Ok(()) => {
+                                self.editing_path = false;
+                                self.refresh_local_addons();
+                                self.status = format!(
+                                    "Saved AddOns path ({} local folder(s) found).",
+                                    self.local_addons.len()
+                                );
+                            }
+                            Err(e) => self.status = e,
+                        }
+                    } else {
+                        self.status = "Directory does not exist. Check the path and try again.".to_string();
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.path_input.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.path_input.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if let Some(confirm) = self.confirm_delete.take() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.execute_delete(confirm);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.status = "Delete cancelled.".to_string();
+                }
+                _ => {
+                    self.confirm_delete = Some(confirm);
+                }
+            }
+            return;
+        }
+
+        if let Some(modal) = &mut self.audit_modal {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    self.audit_modal = None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let len = modal.report.findings.len();
+                    if len > 0 {
+                        let next = modal.state.selected().map_or(0, |i| i.saturating_sub(1));
+                        modal.state.select(Some(next));
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let len = modal.report.findings.len();
+                    if len > 0 {
+                        let next = modal.state.selected().map_or(0, |i| (i + 1).min(len - 1));
+                        modal.state.select(Some(next));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if let Some(picker) = &mut self.asset_picker {
+            match key.code {
+                KeyCode::Esc => {
+                    self.asset_picker = None;
+                    self.status = "Install cancelled.".to_string();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let len = picker.options.len();
+                    if len > 0 {
+                        let next = picker.state.selected().map_or(0, |i| i.saturating_sub(1));
+                        picker.state.select(Some(next));
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let len = picker.options.len();
+                    if len > 0 {
+                        let next = picker
+                            .state
+                            .selected()
+                            .map_or(0, |i| (i + 1).min(len - 1));
+                        picker.state.select(Some(next));
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(idx) = picker.state.selected()
+                        && let Some(flag) = picker.selected.get_mut(idx)
+                    {
+                        *flag = !*flag;
+                    }
+                }
+                KeyCode::Char('a') => {
+                    let all_selected = picker.selected.iter().all(|&s| s);
+                    picker.selected.fill(!all_selected);
+                }
+                KeyCode::Enter => {
+                    let picker = self.asset_picker.take().unwrap();
+                    let mut chosen: Vec<(String, String, ReleaseAsset)> = picker
+                        .options
+                        .iter()
+                        .zip(picker.selected.iter())
+                        .filter(|&(_, checked)| *checked)
+                        .map(|(opt, _)| {
+                            (
+                                install_state_key(&picker.repo, &opt.tag_name),
+                                opt.tag_name.clone(),
+                                opt.asset.clone(),
+                            )
+                        })
+                        .collect();
+
+                    if chosen.is_empty()
+                        && let Some(idx) = picker.state.selected()
+                    {
+                        let opt = &picker.options[idx];
+                        chosen.push((
+                            install_state_key(&picker.repo, &opt.tag_name),
+                            opt.tag_name.clone(),
+                            opt.asset.clone(),
+                        ));
+                    }
+                    self.spawn_install_batch(chosen);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Global shortcuts when not typing in search input.
+        let typing_search = self.tab == Tab::Search && self.search_focus == SearchFocus::Input;
+        if !typing_search {
+            match key.code {
+                KeyCode::Char('q') => {
+                    self.should_quit = true;
+                    return;
+                }
+                KeyCode::Char('1') => {
+                    self.tab = Tab::Installed;
+                    return;
+                }
+                KeyCode::Char('2') => {
+                    self.tab = Tab::Search;
+                    return;
+                }
+                KeyCode::Char('c') => {
+                    self.path_input = self.config.addons_path.clone();
+                    self.editing_path = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if key.code == KeyCode::Tab {
+            self.tab = match self.tab {
+                Tab::Installed => Tab::Search,
+                Tab::Search => Tab::Installed,
+            };
+            return;
+        }
+
+        match self.tab {
+            Tab::Installed => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let len = self.installed_total_len();
+                    if len > 0 {
+                        let next = self
+                            .installed_list_state
+                            .selected()
+                            .map_or(0, |i| i.saturating_sub(1));
+                        self.installed_list_state.select(Some(next));
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let len = self.installed_total_len();
+                    if len > 0 {
+                        let next = self
+                            .installed_list_state
+                            .selected()
+                            .map_or(0, |i| (i + 1).min(len - 1));
+                        self.installed_list_state.select(Some(next));
+                    }
+                }
+                KeyCode::Char('r') => self.spawn_check_updates(),
+                KeyCode::Char('u') => self.spawn_update_all(),
+                KeyCode::Char('l') => self.spawn_link_local_addons(),
+                KeyCode::Char('a') => self.spawn_audit_all(),
+                KeyCode::Enter => {
+                    if let Some(idx) = self.installed_list_state.selected() {
+                        let managed_len = self.state.addons.len();
+                        if idx >= managed_len
+                            && let Some(local) = self.local_addons.get(idx - managed_len)
+                        {
+                            self.search_query = local
+                                .github_hint
+                                .clone()
+                                .unwrap_or_else(|| local.folder.clone());
+                            self.tab = Tab::Search;
+                            self.spawn_search();
+                        }
+                    }
+                }
+                KeyCode::Char('s') => {
+                    self.refresh_local_addons();
+                    self.status = format!(
+                        "Scanned AddOns folder: {} GitHub, {} local.",
+                        self.state.addons.len(),
+                        self.local_addons.len()
+                    );
+                }
+                KeyCode::Char('d') => {
+                    if !self.busy {
+                        self.prompt_delete_selected();
+                    }
+                }
+                _ => {}
+            },
+            Tab::Search => match self.search_focus {
+                SearchFocus::Input => match key.code {
+                    KeyCode::Esc => {
+                        if !self.search_results.is_empty() {
+                            self.search_focus = SearchFocus::Results;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if !self.search_results.is_empty() {
+                            self.search_focus = SearchFocus::Results;
+                        }
+                    }
+                    KeyCode::Enter => self.spawn_search(),
+                    KeyCode::Backspace => {
+                        self.search_query.pop();
+                    }
+                    KeyCode::Char(c) => {
+                        self.search_query.push(c);
+                    }
+                    _ => {}
+                },
+                SearchFocus::Results => match key.code {
+                    KeyCode::Char('/') => {
+                        self.search_focus = SearchFocus::Input;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let sel = self.search_list_state.selected().unwrap_or(0);
+                        if sel == 0 {
+                            self.search_focus = SearchFocus::Input;
+                        } else {
+                            self.search_list_state.select(Some(sel - 1));
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let len = self.search_results.len();
+                        if len > 0 {
+                            let next = self
+                                .search_list_state
+                                .selected()
+                                .map_or(0, |i| (i + 1).min(len - 1));
+                            self.search_list_state.select(Some(next));
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Char('i') => {
+                        if let Some(idx) = self.search_list_state.selected()
+                            && let Some(repo) = self.search_results.get(idx)
+                        {
+                            self.spawn_fetch_release(repo.full_name.clone());
+                        }
+                    }
+                    _ => {}
+                },
+            },
+        }
+    }
+}
+
+fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(height),
+            Constraint::Fill(1),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vert[1])[1]
+}
+
+fn install_state_key(repo: &str, tag_name: &str) -> String {
+    if let Some((prefix, _)) = tag_name.split_once('/') {
+        format!("{repo}#{prefix}")
+    } else {
+        repo.to_string()
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KB", bytes / 1024)
+    }
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 || text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        let cur_len = current.chars().count();
+        if current.is_empty() {
+            current.push_str(word);
+        } else if cur_len + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn key_hints_line(hints: &[(&str, &str)]) -> Line<'static> {
+    let gold = Style::default()
+        .fg(Color::Rgb(255, 209, 0))
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::Rgb(150, 150, 165));
+    let mut spans = Vec::with_capacity(hints.len() * 3);
+    for (i, (key, label)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", dim));
+        }
+        spans.push(Span::styled(format!("[{key}]"), gold));
+        spans.push(Span::styled(format!(" {label}"), dim));
+    }
+    Line::from(spans)
+}
+
+fn draw(f: &mut Frame, app: &mut App) {
+    let gold = Color::Rgb(255, 209, 0);
+    let arcane = Color::Rgb(105, 204, 240);
+    let sel_bg = Color::Rgb(28, 52, 84);
+    let bronze = Color::Rgb(130, 115, 85);
+    let dim = Color::Rgb(140, 140, 155);
+    let emerald = Color::Rgb(64, 255, 128);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(4),
+            Constraint::Min(6),
+        ])
+        .split(f.area());
+
+    // Header: Tabs + WoW Path
+    let header_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(46), Constraint::Min(20)])
+        .split(chunks[0]);
+
+    let installed_tab = format!("1: Installed ({})", app.installed_total_len());
+    let search_tab = if app.search_results.is_empty() {
+        "2: Search".to_string()
+    } else {
+        format!("2: Search ({})", app.search_results.len())
+    };
+    let tab_idx = match app.tab {
+        Tab::Installed => 0,
+        Tab::Search => 1,
+    };
+    let tabs = Tabs::new(vec![installed_tab, search_tab])
+        .select(tab_idx)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(gold))
+                .title(Span::styled(
+                    " ⚔ WOW TUX FORGE ",
+                    Style::default().fg(gold).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .style(Style::default().fg(dim))
+        .highlight_style(Style::default().fg(gold).add_modifier(Modifier::BOLD));
+    f.render_widget(tabs, header_chunks[0]);
+
+    let path_label = if app.config.addons_path.is_empty() {
+        "Not configured — press [c] to set path"
+    } else {
+        &app.config.addons_path
+    };
+    let path_box = Paragraph::new(Line::from(Span::styled(
+        path_label,
+        Style::default().fg(if app.config.addons_path.is_empty() {
+            Color::Red
+        } else {
+            arcane
+        }),
+    )))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(bronze))
+            .title(Span::styled(" WoW AddOns Directory ", Style::default().fg(dim))),
+    );
+    f.render_widget(path_box, header_chunks[1]);
+
+    // Main body
+    match app.tab {
+        Tab::Installed => {
+            let mut rows: Vec<Row> = Vec::new();
+            for (repo, info) in &app.state.addons {
+                let status_cell = match app.latest_tags.get(repo) {
+                    Some(Ok(latest)) if latest != &info.tag => Cell::from(Span::styled(
+                        format!("⬆ Update: {latest}"),
+                        Style::default().fg(emerald).add_modifier(Modifier::BOLD),
+                    )),
+                    Some(Ok(_)) => {
+                        Cell::from(Span::styled("✓ Up to date", Style::default().fg(dim)))
+                    }
+                    Some(Err(e)) => {
+                        Cell::from(Span::styled(format!("✖ {e}"), Style::default().fg(Color::Red)))
+                    }
+                    None => Cell::from(Span::styled("• GitHub (not checked)", Style::default().fg(dim))),
+                };
+                rows.push(Row::new(vec![
+                    Cell::from(Span::styled(
+                        repo.as_str(),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    )),
+                    Cell::from(Span::styled(info.tag.as_str(), Style::default().fg(arcane))),
+                    status_cell,
+                ]));
+            }
+
+            for local in &app.local_addons {
+                let ver = local.version.as_deref().unwrap_or("-");
+                let status_cell = match &local.github_hint {
+                    Some(repo) => Cell::from(Span::styled(
+                        format!("◈ Local -> {repo} ([l] link)"),
+                        Style::default().fg(gold),
+                    )),
+                    None => Cell::from(Span::styled(
+                        "○ Local ([Enter] search GitHub)",
+                        Style::default().fg(arcane),
+                    )),
+                };
+                rows.push(Row::new(vec![
+                    Cell::from(Span::raw(local.folder.as_str())),
+                    Cell::from(Span::styled(ver, Style::default().fg(dim))),
+                    status_cell,
+                ]));
+            }
+
+            if rows.is_empty() {
+                rows.push(Row::new(vec![
+                    Cell::from(Span::styled(
+                        "No addons found. Press [Tab] or [2] to search GitHub.",
+                        Style::default().fg(dim),
+                    )),
+                    Cell::from(""),
+                    Cell::from(""),
+                ]));
+            }
+
+            let header = Row::new(vec!["Addon / Repository", "Version", "Status / Source"])
+                .style(Style::default().fg(gold).add_modifier(Modifier::BOLD))
+                .bottom_margin(1);
+
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Percentage(40),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(40),
+                ],
+            )
+            .header(header)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(bronze))
+                    .title(Span::styled(" Installed Addons ", Style::default().fg(gold))),
+            )
+            .row_highlight_style(
+                Style::default()
+                    .bg(sel_bg)
+                    .fg(gold)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+
+            f.render_stateful_widget(table, chunks[2], &mut app.installed_list_state);
+        }
+        Tab::Search => {
+            let search_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(3)])
+                .split(chunks[2]);
+
+            let input_focused = app.search_focus == SearchFocus::Input;
+            let input_text = if app.search_query.is_empty() {
+                Span::styled(
+                    "Type addon name or owner/repo and press Enter...",
+                    Style::default().fg(dim),
+                )
+            } else {
+                Span::styled(
+                    app.search_query.as_str(),
+                    Style::default().fg(Color::White),
+                )
+            };
+            let input = Paragraph::new(Line::from(input_text)).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(if input_focused { gold } else { bronze }))
+                    .title(Span::styled(
+                        " GitHub Search ",
+                        Style::default().fg(if input_focused { gold } else { dim }),
+                    )),
+            );
+            f.render_widget(input, search_chunks[0]);
+
+            let results_focused = app.search_focus == SearchFocus::Results;
+            let desc_width = ((search_chunks[1].width.saturating_sub(6)) as usize * 56 / 100).max(20);
+            let rows: Vec<Row> = app
+                .search_results
+                .iter()
+                .map(|r| {
+                    let desc = r.description.as_deref().unwrap_or("");
+                    let wrapped = wrap_text(desc, desc_width);
+                    let height = wrapped.len().max(1) as u16;
+                    let desc_text = Text::from(
+                        wrapped
+                            .into_iter()
+                            .map(|l| Line::from(Span::styled(l, Style::default().fg(dim))))
+                            .collect::<Vec<_>>(),
+                    );
+                    Row::new(vec![
+                        Cell::from(Span::styled(
+                            r.full_name.as_str(),
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        )),
+                        Cell::from(Span::styled(
+                            format!("★ {}", r.stargazers_count),
+                            Style::default().fg(gold),
+                        )),
+                        Cell::from(desc_text),
+                    ])
+                    .height(height)
+                })
+                .collect();
+
+            let header = Row::new(vec!["Repository", "Stars", "Description"])
+                .style(Style::default().fg(gold).add_modifier(Modifier::BOLD))
+                .bottom_margin(1);
+
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Percentage(34),
+                    Constraint::Length(10),
+                    Constraint::Percentage(56),
+                ],
+            )
+            .header(header)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(if results_focused { gold } else { bronze }))
+                    .title(Span::styled(
+                        " Search Results ",
+                        Style::default().fg(if results_focused { gold } else { dim }),
+                    )),
+            )
+            .row_highlight_style(
+                Style::default()
+                    .bg(sel_bg)
+                    .fg(gold)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+            f.render_stateful_widget(table, search_chunks[1], &mut app.search_list_state);
+        }
+    }
+
+    // Footer
+    let hints = match app.tab {
+        Tab::Installed => key_hints_line(&[
+            ("u", "Update All"),
+            ("r", "Check"),
+            ("l", "Link GitHub"),
+            ("a", "Security Audit"),
+            ("s", "Scan"),
+            ("d", "Remove"),
+            ("c", "Path"),
+            ("Tab", "Search"),
+            ("q", "Quit"),
+        ]),
+        Tab::Search => key_hints_line(&[
+            ("Enter", "Search / Install"),
+            ("/", "Focus Search"),
+            ("c", "Path"),
+            ("Tab", "Installed"),
+            ("q", "Quit"),
+        ]),
+    };
+
+    let status_line = if app.busy {
+        Line::from(vec![
+            Span::styled(
+                "⚡ Working... ",
+                Style::default().fg(gold).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(app.status.as_str(), Style::default().fg(Color::White)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            app.status.as_str(),
+            Style::default().fg(Color::White),
+        ))
+    };
+
+    let status_bar = Paragraph::new(vec![status_line, hints]).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(bronze)),
+    );
+    f.render_widget(status_bar, chunks[1]);
+
+    // Path editor modal
+    if app.editing_path {
+        let area = centered_rect(75, 5, f.area());
+        f.render_widget(Clear, area);
+        let p = Paragraph::new(app.path_input.as_str())
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(gold))
+                    .title(Span::styled(
+                        " WoW Interface/AddOns Path ([Enter] Save, [Esc] Cancel) ",
+                        Style::default().fg(gold).add_modifier(Modifier::BOLD),
+                    )),
+            );
+        f.render_widget(p, area);
+    }
+
+    // Asset picker modal
+    if let Some(picker) = &mut app.asset_picker {
+        let height = (picker.options.len() as u16 + 2).clamp(5, 16);
+        let area = centered_rect(76, height, f.area());
+        f.render_widget(Clear, area);
+        let items: Vec<ListItem> = picker
+            .options
+            .iter()
+            .zip(picker.selected.iter())
+            .map(|(opt, &checked)| {
+                let sz = format_size(opt.asset.size);
+                let mark = if checked { "[x]" } else { "[ ]" };
+                let mark_style = if checked {
+                    Style::default().fg(emerald).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(dim)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{mark} "), mark_style),
+                    Span::raw(format!(
+                        "[{}] {} ({sz}, {} downloads)",
+                        opt.tag_name, opt.asset.name, opt.asset.download_count
+                    )),
+                ]))
+            })
+            .collect();
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(gold))
+                    .title(Span::styled(
+                        format!(
+                            " {} — [Space] Toggle, [a] All, [Enter] Install, [Esc] Cancel ",
+                            picker.repo
+                        ),
+                        Style::default().fg(gold).add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(sel_bg)
+                    .fg(gold)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+        f.render_stateful_widget(list, area, &mut picker.state);
+    }
+
+    // Security audit modal
+    if let Some(modal) = &mut app.audit_modal {
+        let count = modal.report.findings.len();
+        let max_sev = modal.report.max_severity();
+        let (threat_label, border_col) = match max_sev {
+            Some(security::Severity::High) => ("HIGH", Color::Red),
+            None => ("NONE (Clean)", emerald),
+        };
+
+        let area_w = (f.area().width * 84 / 100).max(40);
+        let wrap_w = area_w.saturating_sub(10) as usize;
+        let total_lines: usize = modal
+            .report
+            .findings
+            .iter()
+            .map(|x| 1 + wrap_text(&x.explanation, wrap_w).len())
+            .sum();
+        let height = (total_lines as u16 + 3).clamp(5, 22);
+        let area = centered_rect(84, height, f.area());
+        f.render_widget(Clear, area);
+
+        if modal.report.findings.is_empty() {
+            let p = Paragraph::new(Line::from(Span::styled(
+                "✓ Threat: NONE — no executables, obfuscated Lua, or sensitive mail/trade/gold calls found.",
+                Style::default().fg(emerald),
+            )))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(border_col))
+                    .title(Span::styled(
+                        format!(
+                            " Security Audit: {} | Threat: {threat_label} ([Esc/Enter] Close) ",
+                            modal.title
+                        ),
+                        Style::default().fg(border_col).add_modifier(Modifier::BOLD),
+                    )),
+            );
+            f.render_widget(p, area);
+        } else {
+            let items: Vec<ListItem> = modal
+                .report
+                .findings
+                .iter()
+                .map(|finding| {
+                    let (badge, col) = match finding.severity {
+                        security::Severity::High => ("[HIGH]", Color::Red),
+                    };
+                    let mut lines = vec![Line::from(vec![
+                        Span::styled(
+                            format!("{badge} "),
+                            Style::default().fg(col).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("{} — ", finding.location),
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(finding.reason.as_str(), Style::default().fg(gold)),
+                    ])];
+                    for (i, wline) in wrap_text(&finding.explanation, wrap_w).into_iter().enumerate() {
+                        let prefix = if i == 0 { "   ↳ " } else { "     " };
+                        lines.push(Line::from(Span::styled(
+                            format!("{prefix}{wline}"),
+                            Style::default().fg(dim),
+                        )));
+                    }
+                    ListItem::new(Text::from(lines))
+                })
+                .collect();
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(border_col))
+                        .title(Span::styled(
+                            format!(
+                                " Security Audit: {} | Threat: {threat_label} ({count} finding(s) — [Esc/Enter] Close) ",
+                                modal.title
+                            ),
+                            Style::default().fg(border_col).add_modifier(Modifier::BOLD),
+                        )),
+                )
+                .highlight_style(Style::default().bg(sel_bg).add_modifier(Modifier::BOLD))
+                .highlight_symbol("▶ ");
+            f.render_stateful_widget(list, area, &mut modal.state);
+        }
+    }
+
+    // Delete confirmation modal
+    if let Some(confirm) = &app.confirm_delete {
+        let area = centered_rect(70, 6, f.area());
+        f.render_widget(Clear, area);
+        let folders_list = confirm.folders.join(", ");
+        let p = Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!("Delete {}?", confirm.label),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("Folders: {folders_list}"),
+                Style::default().fg(dim),
+            )),
+            Line::from(vec![
+                Span::styled("[y / Enter]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::raw(" Delete   "),
+                Span::styled("[n / Esc]", Style::default().fg(gold).add_modifier(Modifier::BOLD)),
+                Span::raw(" Cancel"),
+            ]),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Red))
+                .title(Span::styled(
+                    " Confirm Deletion ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+        );
+        f.render_widget(p, area);
+    }
+}
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+}
+
+fn main() -> io::Result<()> {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut app = App::new();
+
+    while !app.should_quit {
+        app.poll_bg();
+        terminal.draw(|f| draw(f, &mut app))?;
+
+        if event::poll(Duration::from_millis(80))?
+            && let Event::Key(key) = event::read()?
+        {
+            app.handle_key(key);
+        }
+    }
+
+    restore_terminal();
+    Ok(())
+}
