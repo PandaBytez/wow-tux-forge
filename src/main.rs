@@ -159,6 +159,8 @@ impl App {
             );
             if app.local_addons.iter().any(|l| l.github_hint.is_some()) {
                 app.spawn_link_local_addons();
+            } else if !app.state.addons.is_empty() {
+                app.spawn_check_updates();
             }
         }
         app
@@ -713,6 +715,9 @@ impl App {
                     self.status = format!(
                         "Linked {count} addon(s) to GitHub ({failed} had no GitHub release zips)."
                     );
+                    if self.latest_tags.is_empty() && !self.state.addons.is_empty() {
+                        self.spawn_check_updates();
+                    }
                 }
             }
             BgResult::AuditDone {
