@@ -949,7 +949,6 @@ impl App {
                     self.installed_list_state
                         .select(move_selection(self.installed_list_state.selected(), len, 1));
                 }
-                KeyCode::Char('r') => self.spawn_check_updates(),
                 KeyCode::Char('u') => self.spawn_update_all(),
                 KeyCode::Char('l') => self.spawn_link_local_addons(),
                 KeyCode::Char('a') => self.spawn_audit_all(),
@@ -1526,7 +1525,6 @@ fn draw(f: &mut Frame, app: &mut App) {
     let hints = match app.tab {
         Tab::Installed => key_hints_line(&[
             ("u", "Update All"),
-            ("r", "Check"),
             ("l", "Link GitHub"),
             ("a", "Security Audit"),
             ("s", "Scan"),

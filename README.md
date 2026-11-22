@@ -35,7 +35,6 @@ Run `wow-tux-forge` and press `c` on first launch to set your WoW `Interface/Add
 | `1` / `2` / `Tab` | Switch between **Installed** and **Search** tabs |
 | `c` | Configure `AddOns` directory path |
 | `j` / `k` / `↑` / `↓` | Navigate lists |
-| `r` | Check for updates (Installed) |
 | `u` | Update all outdated addons (Installed) |
 | `l` | Link local addons from `.toc` GitHub URLs (Installed) |
 | `a` | Security audit all addons (Installed) |
