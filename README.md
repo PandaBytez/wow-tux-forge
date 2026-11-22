@@ -2,6 +2,9 @@
 
 Terminal UI (TUI) manager for World of Warcraft addons hosted on GitHub.
 
+![Installed addons view](assets/installed.png)
+![GitHub search results view](assets/search.png)
+
 ## Features
 
 - **GitHub-native:** Search repositories and install release `.zip` assets directly into your `Interface/AddOns` directory.
