@@ -310,20 +310,20 @@ pub fn fetch_install_options(client: &Client, repo: &str) -> Result<Vec<ReleaseO
         }
     }
 
-    // No GitHub Releases: offer both tags and default branch (main/master) in the picker.
+    // No GitHub Releases: offer default branch (main/master) first, then tags in the picker.
     let mut options = Vec::new();
-    for rel in fetch_tags_list(client, repo, 10) {
-        for asset in rel.assets {
-            options.push(ReleaseOption {
-                tag_name: rel.tag_name.clone(),
-                asset,
-            });
-        }
-    }
     if let Ok(branch_rel) = default_branch_release(client, repo) {
         for asset in branch_rel.assets {
             options.push(ReleaseOption {
                 tag_name: branch_rel.tag_name.clone(),
+                asset,
+            });
+        }
+    }
+    for rel in fetch_tags_list(client, repo, 10) {
+        for asset in rel.assets {
+            options.push(ReleaseOption {
+                tag_name: rel.tag_name.clone(),
                 asset,
             });
         }
