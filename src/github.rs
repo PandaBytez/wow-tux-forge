@@ -274,41 +274,16 @@ fn fetch_releases_list(client: &Client, repo: &str) -> Result<Vec<Release>, Stri
 }
 
 pub fn group_install_options(releases: Vec<Release>) -> Vec<ReleaseOption> {
-    if releases.is_empty() {
-        return Vec::new();
-    }
-    let has_prefixed = releases.iter().any(|r| r.tag_name.contains('/'));
-    if has_prefixed {
-        let mut seen_prefixes = std::collections::HashSet::new();
-        let mut options = Vec::new();
-        for r in releases {
-            let prefix = r
-                .tag_name
-                .split('/')
-                .next()
-                .unwrap_or(&r.tag_name)
-                .to_string();
-            if seen_prefixes.insert(prefix) {
-                for asset in r.assets {
-                    options.push(ReleaseOption {
-                        tag_name: r.tag_name.clone(),
-                        asset,
-                    });
-                }
-            }
-        }
-        options
-    } else {
-        let first = releases.into_iter().next().unwrap();
-        first
-            .assets
-            .into_iter()
-            .map(|asset| ReleaseOption {
-                tag_name: first.tag_name.clone(),
+    releases
+        .into_iter()
+        .flat_map(|r| {
+            let tag = r.tag_name;
+            r.assets.into_iter().map(move |asset| ReleaseOption {
+                tag_name: tag.clone(),
                 asset,
             })
-            .collect()
-    }
+        })
+        .collect()
 }
 
 pub fn fetch_install_options(client: &Client, repo: &str) -> Result<Vec<ReleaseOption>, String> {
@@ -452,9 +427,10 @@ mod tests {
             },
         ];
         let opts = group_install_options(prefixed);
-        assert_eq!(opts.len(), 2);
+        assert_eq!(opts.len(), 3);
         assert_eq!(opts[0].tag_name, "spoken/v3.11.0");
-        assert_eq!(opts[1].tag_name, "quests/v2.5.0");
+        assert_eq!(opts[1].tag_name, "spoken/v3.10.0");
+        assert_eq!(opts[2].tag_name, "quests/v2.5.0");
 
         let standard = vec![
             Release {
@@ -469,7 +445,8 @@ mod tests {
             },
         ];
         let opts2 = group_install_options(standard);
-        assert_eq!(opts2.len(), 2);
+        assert_eq!(opts2.len(), 3);
         assert_eq!(opts2[0].tag_name, "v2.0");
+        assert_eq!(opts2[2].tag_name, "v1.0");
     }
 }
