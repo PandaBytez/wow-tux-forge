@@ -8,6 +8,7 @@ pub struct RepoSummary {
     pub full_name: String,
     pub stargazers_count: u64,
     pub description: Option<String>,
+    pub pushed_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

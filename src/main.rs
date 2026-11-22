@@ -1284,7 +1284,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             f.render_widget(input, search_chunks[0]);
 
             let results_focused = app.search_focus == SearchFocus::Results;
-            let desc_width = ((search_chunks[1].width.saturating_sub(6)) as usize * 56 / 100).max(20);
+            let desc_width = ((search_chunks[1].width.saturating_sub(6)) as usize * 51 / 100).max(20);
             let rows: Vec<Row> = app
                 .search_results
                 .iter()
@@ -1298,6 +1298,11 @@ fn draw(f: &mut Frame, app: &mut App) {
                             .map(|l| Line::from(Span::styled(l, Style::default().fg(dim))))
                             .collect::<Vec<_>>(),
                     );
+                    let updated = r
+                        .pushed_at
+                        .as_deref()
+                        .map(relative_time_ago)
+                        .unwrap_or_else(|| "—".to_string());
                     Row::new(vec![
                         Cell::from(Span::styled(
                             r.full_name.as_str(),
@@ -1307,22 +1312,24 @@ fn draw(f: &mut Frame, app: &mut App) {
                             format!("★ {}", r.stargazers_count),
                             Style::default().fg(gold),
                         )),
+                        Cell::from(Span::styled(updated, Style::default().fg(arcane))),
                         Cell::from(desc_text),
                     ])
                     .height(height)
                 })
                 .collect();
 
-            let header = Row::new(vec!["Repository", "Stars", "Description"])
+            let header = Row::new(vec!["Repository", "Stars", "Updated", "Description"])
                 .style(Style::default().fg(gold).add_modifier(Modifier::BOLD))
                 .bottom_margin(1);
 
             let table = Table::new(
                 rows,
                 [
-                    Constraint::Percentage(34),
+                    Constraint::Percentage(30),
+                    Constraint::Length(9),
                     Constraint::Length(10),
-                    Constraint::Percentage(56),
+                    Constraint::Percentage(51),
                 ],
             )
             .header(header)
@@ -1621,4 +1628,71 @@ fn main() -> io::Result<()> {
 
     restore_terminal();
     Ok(())
+}
+
+fn relative_time_ago(iso: &str) -> String {
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return "—".to_string();
+    };
+    relative_time_ago_from(iso, now.as_secs() as i64)
+}
+
+fn relative_time_ago_from(iso: &str, now_secs: i64) -> String {
+    let Some((date, time)) = iso.trim_end_matches('Z').split_once('T') else {
+        return "—".to_string();
+    };
+    let mut d = date.split('-');
+    let mut t = time.split(':');
+    let (Some(y), Some(m), Some(day)) = (
+        d.next().and_then(|s| s.parse::<i64>().ok()),
+        d.next().and_then(|s| s.parse::<i64>().ok()),
+        d.next().and_then(|s| s.parse::<i64>().ok()),
+    ) else {
+        return "—".to_string();
+    };
+    let (Some(hh), Some(mm), Some(ss)) = (
+        t.next().and_then(|s| s.parse::<i64>().ok()),
+        t.next().and_then(|s| s.parse::<i64>().ok()),
+        t.next().and_then(|s| s.parse::<i64>().ok()),
+    ) else {
+        return "—".to_string();
+    };
+
+    // Howard Hinnant's days-from-civil algorithm (days since 1970-01-01).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let ts = days * 86400 + hh * 3600 + mm * 60 + ss;
+
+    let diff = (now_secs - ts).max(0);
+    if diff < 3600 {
+        format!("{}m ago", (diff / 60).max(1))
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else if diff < 86400 * 30 {
+        format!("{}d ago", diff / 86400)
+    } else if diff < 86400 * 365 {
+        format!("{}mo ago", diff / (86400 * 30))
+    } else {
+        format!("{}y ago", diff / (86400 * 365))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_time_ago_from;
+
+    #[test]
+    fn formats_relative_time_ago() {
+        // 2026-11-22T12:00:00Z
+        let now = 1_795_348_800;
+        assert_eq!(relative_time_ago_from("2026-11-22T11:30:00Z", now), "30m ago");
+        assert_eq!(relative_time_ago_from("2026-11-22T09:00:00Z", now), "3h ago");
+        assert_eq!(relative_time_ago_from("2026-11-19T12:00:00Z", now), "3d ago");
+        assert_eq!(relative_time_ago_from("2026-09-22T12:00:00Z", now), "2mo ago");
+        assert_eq!(relative_time_ago_from("2024-11-22T12:00:00Z", now), "2y ago");
+    }
 }
