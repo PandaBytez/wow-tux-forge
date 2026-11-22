@@ -284,6 +284,7 @@ impl App {
                     tag,
                     asset_name: asset.name,
                     folders,
+                    installed_at: Some(now_unix_secs()),
                 });
                 let _ = std::fs::remove_file(&tmp_zip);
                 match res {
@@ -394,6 +395,7 @@ impl App {
                     tag: release.tag_name,
                     asset_name: asset.name,
                     folders,
+                    installed_at: Some(now_unix_secs()),
                 });
                 let _ = std::fs::remove_file(&tmp_zip);
                 match res {
@@ -463,6 +465,7 @@ impl App {
                             tag: local_ver.unwrap_or_else(|| "local".to_string()),
                             asset_name: rel.assets[0].name.clone(),
                             folders,
+                            installed_at: Some(now_unix_secs()),
                         },
                     )),
                     _ => Err(()),
@@ -1335,12 +1338,17 @@ fn draw(f: &mut Frame, app: &mut App) {
                     }
                     None => Cell::from(Span::styled("• GitHub (not checked)", Style::default().fg(dim))),
                 };
+                let installed_ago = info
+                    .installed_at
+                    .map(relative_unix_ago)
+                    .unwrap_or_else(|| "—".to_string());
                 rows.push(Row::new(vec![
                     Cell::from(Span::styled(
                         repo.as_str(),
                         Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                     )),
                     Cell::from(Span::styled(info.tag.as_str(), Style::default().fg(arcane))),
+                    Cell::from(Span::styled(installed_ago, Style::default().fg(dim))),
                     status_cell,
                 ]));
             }
@@ -1360,6 +1368,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 rows.push(Row::new(vec![
                     Cell::from(Span::raw(local.folder.as_str())),
                     Cell::from(Span::styled(ver, Style::default().fg(dim))),
+                    Cell::from(Span::styled("—", Style::default().fg(dim))),
                     status_cell,
                 ]));
             }
@@ -1372,19 +1381,21 @@ fn draw(f: &mut Frame, app: &mut App) {
                     )),
                     Cell::from(""),
                     Cell::from(""),
+                    Cell::from(""),
                 ]));
             }
 
-            let header = Row::new(vec!["Addon / Repository", "Version", "Status / Source"])
+            let header = Row::new(vec!["Addon / Repository", "Version", "Installed", "Status / Source"])
                 .style(Style::default().fg(gold).add_modifier(Modifier::BOLD))
                 .bottom_margin(1);
 
             let table = Table::new(
                 rows,
                 [
-                    Constraint::Percentage(40),
-                    Constraint::Percentage(20),
-                    Constraint::Percentage(40),
+                    Constraint::Percentage(34),
+                    Constraint::Percentage(18),
+                    Constraint::Length(11),
+                    Constraint::Percentage(37),
                 ],
             )
             .header(header)
@@ -1816,11 +1827,35 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn format_relative_diff(diff: i64) -> String {
+    let diff = diff.max(0);
+    if diff < 3600 {
+        format!("{}m ago", (diff / 60).max(1))
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else if diff < 86400 * 30 {
+        format!("{}d ago", diff / 86400)
+    } else if diff < 86400 * 365 {
+        format!("{}mo ago", diff / (86400 * 30))
+    } else {
+        format!("{}y ago", diff / (86400 * 365))
+    }
+}
+
+fn relative_unix_ago(ts: u64) -> String {
+    let now = now_unix_secs() as i64;
+    format_relative_diff(now - ts as i64)
+}
+
 fn relative_time_ago(iso: &str) -> String {
-    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
-        return "—".to_string();
-    };
-    relative_time_ago_from(iso, now.as_secs() as i64)
+    relative_time_ago_from(iso, now_unix_secs() as i64)
 }
 
 fn relative_time_ago_from(iso: &str, now_secs: i64) -> String {
@@ -1853,18 +1888,7 @@ fn relative_time_ago_from(iso: &str, now_secs: i64) -> String {
     let days = era * 146097 + doe - 719468;
     let ts = days * 86400 + hh * 3600 + mm * 60 + ss;
 
-    let diff = (now_secs - ts).max(0);
-    if diff < 3600 {
-        format!("{}m ago", (diff / 60).max(1))
-    } else if diff < 86400 {
-        format!("{}h ago", diff / 3600)
-    } else if diff < 86400 * 30 {
-        format!("{}d ago", diff / 86400)
-    } else if diff < 86400 * 365 {
-        format!("{}mo ago", diff / (86400 * 30))
-    } else {
-        format!("{}y ago", diff / (86400 * 365))
-    }
+    format_relative_diff(now_secs - ts)
 }
 
 #[cfg(test)]

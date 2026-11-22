@@ -14,6 +14,8 @@ pub struct InstalledAddon {
     pub tag: String,
     pub asset_name: String,
     pub folders: Vec<String>,
+    #[serde(default)]
+    pub installed_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -82,6 +84,7 @@ mod tests {
                 tag: "v1.0.0".to_string(),
                 asset_name: "Bar.zip".to_string(),
                 folders: vec!["Bar".to_string()],
+                installed_at: Some(1_795_348_800),
             },
         );
         save_json(&tmp, &state).unwrap();
