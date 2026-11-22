@@ -167,11 +167,6 @@ pub fn search_repos(client: &Client, query: &str) -> Result<Vec<RepoSummary>, St
 }
 
 #[derive(Debug, Deserialize)]
-struct TagItem {
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct RepoMeta {
     default_branch: String,
 }
@@ -184,31 +179,7 @@ struct CommitItem {
 fn fallback_archive_release(client: &Client, repo: &str) -> Result<Release, String> {
     let repo_name = repo.split('/').nth(1).unwrap_or(repo);
 
-    // 1. Prefer latest git tag if the repo uses tags without GitHub Releases.
-    let tags_url = format!("https://api.github.com/repos/{repo}/tags?per_page=1");
-    if let Ok(resp) = client
-        .get(&tags_url)
-        .send()
-        && resp.status().is_success()
-        && let Ok(tags) = resp.json::<Vec<TagItem>>()
-        && let Some(tag) = tags.into_iter().next()
-    {
-        return Ok(Release {
-            tag_name: tag.name.clone(),
-            draft: false,
-            assets: vec![ReleaseAsset {
-                name: format!("{repo_name}-{}.zip", tag.name),
-                browser_download_url: format!(
-                    "https://api.github.com/repos/{repo}/zipball/{}",
-                    percent_encode(&tag.name)
-                ),
-                size: 0,
-                download_count: 0,
-            }],
-        });
-    }
-
-    // 2. Fall back to default branch latest commit zipball.
+    // Fall back to default branch (main/master) latest commit zipball.
     let meta_url = format!("https://api.github.com/repos/{repo}");
     let meta_resp = client
         .get(&meta_url)
