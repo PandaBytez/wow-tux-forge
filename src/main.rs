@@ -264,21 +264,20 @@ impl App {
             };
 
             let addons_path = Path::new(&addons_dir);
-            let tmp_zip = std::env::temp_dir().join(format!("wow-tux-forge-{}.zip", std::process::id()));
+            let tmp_zip = cache_temp_zip("install");
             for ((state_key, tag, asset), old_folders) in items.into_iter().zip(existing_folders) {
-                let res = github::download_to_file(&client, &asset.browser_download_url, &tmp_zip)
-                    .and_then(|()| {
-                        let _report = security::audit_zip_file(&tmp_zip)?;
-                        if !old_folders.is_empty() {
-                            addon::remove_folders(addons_path, &old_folders)?;
-                        }
-                        let folders = addon::extract_addon_zip_file(&tmp_zip, addons_path)?;
-                        Ok(InstalledAddon {
-                            tag,
-                            asset_name: asset.name,
-                            folders,
-                        })
-                    });
+                let res = install_asset_to_addons(
+                    &client,
+                    &asset.browser_download_url,
+                    addons_path,
+                    &old_folders,
+                    &tmp_zip,
+                )
+                .map(|folders| InstalledAddon {
+                    tag,
+                    asset_name: asset.name,
+                    folders,
+                });
                 let _ = std::fs::remove_file(&tmp_zip);
                 match res {
                     Ok(entry) => installed.push((state_key, entry)),
@@ -302,13 +301,10 @@ impl App {
 
         thread::spawn(move || {
             let results = match github::make_client() {
-                Ok(client) => repos
-                    .into_iter()
-                    .map(|repo| {
-                        let res = github::latest_release_for_key(&client, &repo);
-                        (repo, res)
-                    })
-                    .collect(),
+                Ok(client) => map_parallel(repos, 6, |repo| {
+                    let res = github::latest_release_for_key(&client, &repo);
+                    (repo, res)
+                }),
                 Err(e) => repos.into_iter().map(|r| (r, Err(e.clone()))).collect(),
             };
             let _ = tx.send(BgResult::CheckUpdatesDone(results));
@@ -353,7 +349,7 @@ impl App {
             };
 
             let addons_path = Path::new(&addons_dir);
-            let tmp_zip = std::env::temp_dir().join(format!("wow-tux-forge-upd-{}.zip", std::process::id()));
+            let tmp_zip = cache_temp_zip("update");
             for (repo, current) in tracked {
                 let release = match github::latest_release_for_key(&client, &repo) {
                     Ok(r) => r,
@@ -380,17 +376,18 @@ impl App {
                     continue;
                 };
 
-                let res = github::download_to_file(&client, &asset.browser_download_url, &tmp_zip)
-                    .and_then(|()| {
-                        let _report = security::audit_zip_file(&tmp_zip)?;
-                        addon::remove_folders(addons_path, &current.folders)?;
-                        let folders = addon::extract_addon_zip_file(&tmp_zip, addons_path)?;
-                        Ok(InstalledAddon {
-                            tag: release.tag_name,
-                            asset_name: asset.name,
-                            folders,
-                        })
-                    });
+                let res = install_asset_to_addons(
+                    &client,
+                    &asset.browser_download_url,
+                    addons_path,
+                    &current.folders,
+                    &tmp_zip,
+                )
+                .map(|folders| InstalledAddon {
+                    tag: release.tag_name,
+                    asset_name: asset.name,
+                    folders,
+                });
                 let _ = std::fs::remove_file(&tmp_zip);
                 match res {
                     Ok(new_entry) => updated.push((repo, new_entry)),
@@ -449,20 +446,25 @@ impl App {
                 entry.0.push(folder);
             }
 
-            for (repo, (folders, local_ver)) in by_repo {
-                match github::latest_release(&client, &repo) {
-                    Ok(rel) if !rel.assets.is_empty() => {
-                        let tag = local_ver.unwrap_or_else(|| "local".to_string());
-                        linked.push((
-                            repo,
-                            InstalledAddon {
-                                tag,
-                                asset_name: rel.assets[0].name.clone(),
-                                folders,
-                            },
-                        ));
-                    }
-                    _ => failed += 1,
+            let results = map_parallel(
+                by_repo.into_iter().collect(),
+                6,
+                |(repo, (folders, local_ver))| match github::latest_release(&client, &repo) {
+                    Ok(rel) if !rel.assets.is_empty() => Ok((
+                        repo,
+                        InstalledAddon {
+                            tag: local_ver.unwrap_or_else(|| "local".to_string()),
+                            asset_name: rel.assets[0].name.clone(),
+                            folders,
+                        },
+                    )),
+                    _ => Err(()),
+                },
+            );
+            for res in results {
+                match res {
+                    Ok(item) => linked.push(item),
+                    Err(()) => failed += 1,
                 }
             }
 
@@ -684,7 +686,15 @@ impl App {
             BgResult::LinkLocalDone { linked, failed } => {
                 let count = linked.len();
                 for (repo, entry) in linked {
-                    self.state.addons.insert(repo, entry);
+                    if let Some(existing) = self.state.addons.get_mut(&repo) {
+                        for f in entry.folders {
+                            if !existing.folders.contains(&f) {
+                                existing.folders.push(f);
+                            }
+                        }
+                    } else {
+                        self.state.addons.insert(repo, entry);
+                    }
                 }
                 self.refresh_local_addons();
                 if let Err(e) = storage::save_state(&self.state) {
@@ -788,17 +798,11 @@ impl App {
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     let len = modal.report.findings.len();
-                    if len > 0 {
-                        let next = modal.state.selected().map_or(0, |i| i.saturating_sub(1));
-                        modal.state.select(Some(next));
-                    }
+                    modal.state.select(move_selection(modal.state.selected(), len, -1));
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     let len = modal.report.findings.len();
-                    if len > 0 {
-                        let next = modal.state.selected().map_or(0, |i| (i + 1).min(len - 1));
-                        modal.state.select(Some(next));
-                    }
+                    modal.state.select(move_selection(modal.state.selected(), len, 1));
                 }
                 _ => {}
             }
@@ -813,20 +817,11 @@ impl App {
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     let len = picker.options.len();
-                    if len > 0 {
-                        let next = picker.state.selected().map_or(0, |i| i.saturating_sub(1));
-                        picker.state.select(Some(next));
-                    }
+                    picker.state.select(move_selection(picker.state.selected(), len, -1));
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     let len = picker.options.len();
-                    if len > 0 {
-                        let next = picker
-                            .state
-                            .selected()
-                            .map_or(0, |i| (i + 1).min(len - 1));
-                        picker.state.select(Some(next));
-                    }
+                    picker.state.select(move_selection(picker.state.selected(), len, 1));
                 }
                 KeyCode::Char(' ') => {
                     if let Some(idx) = picker.state.selected()
@@ -909,23 +904,13 @@ impl App {
             Tab::Installed => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     let len = self.installed_total_len();
-                    if len > 0 {
-                        let next = self
-                            .installed_list_state
-                            .selected()
-                            .map_or(0, |i| i.saturating_sub(1));
-                        self.installed_list_state.select(Some(next));
-                    }
+                    self.installed_list_state
+                        .select(move_selection(self.installed_list_state.selected(), len, -1));
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     let len = self.installed_total_len();
-                    if len > 0 {
-                        let next = self
-                            .installed_list_state
-                            .selected()
-                            .map_or(0, |i| (i + 1).min(len - 1));
-                        self.installed_list_state.select(Some(next));
-                    }
+                    self.installed_list_state
+                        .select(move_selection(self.installed_list_state.selected(), len, 1));
                 }
                 KeyCode::Char('r') => self.spawn_check_updates(),
                 KeyCode::Char('u') => self.spawn_update_all(),
@@ -996,13 +981,8 @@ impl App {
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         let len = self.search_results.len();
-                        if len > 0 {
-                            let next = self
-                                .search_list_state
-                                .selected()
-                                .map_or(0, |i| (i + 1).min(len - 1));
-                            self.search_list_state.select(Some(next));
-                        }
+                        self.search_list_state
+                            .select(move_selection(self.search_list_state.selected(), len, 1));
                     }
                     KeyCode::Enter | KeyCode::Char('i') => {
                         if let Some(idx) = self.search_list_state.selected()
@@ -1016,6 +996,106 @@ impl App {
             },
         }
     }
+}
+
+fn cache_temp_zip(kind: &str) -> std::path::PathBuf {
+    let dir = dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("wow-tux-forge");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("{kind}-{}.zip", std::process::id()))
+}
+
+fn install_asset_to_addons(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    addons_path: &Path,
+    old_folders: &[String],
+    tmp_zip: &Path,
+) -> Result<Vec<String>, String> {
+    github::download_to_file(client, url, tmp_zip)?;
+    let report = security::audit_zip_file(tmp_zip)?;
+    if let Some(first) = report.findings.first() {
+        return Err(format!(
+            "Blocked by security audit ({} finding(s)): {} at {}",
+            report.findings.len(),
+            first.reason,
+            first.location
+        ));
+    }
+
+    // Extract to staging inside addons_path first so failed extractions never delete working addons.
+    let staging = addons_path.join(format!(".wow-tux-forge-staging-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| format!("Failed creating staging dir {}: {e}", staging.display()))?;
+
+    let folders = match addon::extract_addon_zip_file(tmp_zip, &staging) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+
+    if !old_folders.is_empty()
+        && let Err(e) = addon::remove_folders(addons_path, old_folders)
+    {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+
+    for folder in &folders {
+        let dest = addons_path.join(folder);
+        if dest.exists() {
+            let _ = std::fs::remove_dir_all(&dest);
+        }
+        if let Err(e) = std::fs::rename(staging.join(folder), &dest) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(format!("Failed moving {folder} into AddOns: {e}"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    Ok(folders)
+}
+
+fn map_parallel<T: Send, R: Send>(
+    items: Vec<T>,
+    workers: usize,
+    f: impl Fn(T) -> R + Send + Sync,
+) -> Vec<R> {
+    let total = items.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    let queue = std::sync::Mutex::new(items.into_iter());
+    let results = std::sync::Mutex::new(Vec::with_capacity(total));
+    let worker_count = workers.min(total).max(1);
+    thread::scope(|s| {
+        for _ in 0..worker_count {
+            s.spawn(|| {
+                loop {
+                    let next = queue.lock().unwrap().next();
+                    let Some(item) = next else { break };
+                    let out = f(item);
+                    results.lock().unwrap().push(out);
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap()
+}
+
+fn move_selection(cur: Option<usize>, len: usize, delta: isize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let next = match (cur, delta) {
+        (None, _) => 0,
+        (Some(i), d) if d < 0 => i.saturating_sub((-d) as usize),
+        (Some(i), d) => (i + d as usize).min(len - 1),
+    };
+    Some(next)
 }
 
 fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
@@ -1486,10 +1566,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     // Security audit modal
     if let Some(modal) = &mut app.audit_modal {
         let count = modal.report.findings.len();
-        let max_sev = modal.report.max_severity();
-        let (threat_label, border_col) = match max_sev {
-            Some(security::Severity::High) => ("HIGH", Color::Red),
-            None => ("NONE (Clean)", emerald),
+        let (threat_label, border_col) = if count > 0 {
+            ("HIGH", Color::Red)
+        } else {
+            ("NONE (Clean)", emerald)
         };
 
         let area_w = (f.area().width * 84 / 100).max(40);
@@ -1529,9 +1609,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 .findings
                 .iter()
                 .map(|finding| {
-                    let (badge, col) = match finding.severity {
-                        security::Severity::High => ("[HIGH]", Color::Red),
-                    };
+                    let (badge, col) = ("[HIGH]", Color::Red);
                     let mut lines = vec![Line::from(vec![
                         Span::styled(
                             format!("{badge} "),
@@ -1698,7 +1776,7 @@ fn relative_time_ago_from(iso: &str, now_secs: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::relative_time_ago_from;
+    use super::{install_state_key, move_selection, relative_time_ago_from, wrap_text};
 
     #[test]
     fn formats_relative_time_ago() {
@@ -1709,5 +1787,18 @@ mod tests {
         assert_eq!(relative_time_ago_from("2026-11-19T12:00:00Z", now), "3d ago");
         assert_eq!(relative_time_ago_from("2026-09-22T12:00:00Z", now), "2mo ago");
         assert_eq!(relative_time_ago_from("2024-11-22T12:00:00Z", now), "2y ago");
+    }
+
+    #[test]
+    fn builds_state_keys_and_wraps_text() {
+        assert_eq!(install_state_key("Questie/Questie", "v1.0"), "Questie/Questie");
+        assert_eq!(
+            install_state_key("Questie/Questie", "bundle/v12"),
+            "Questie/Questie#bundle"
+        );
+        assert_eq!(wrap_text("hello world test", 11), vec!["hello world", "test"]);
+        assert_eq!(move_selection(None, 3, 1), Some(0));
+        assert_eq!(move_selection(Some(2), 3, 1), Some(2));
+        assert_eq!(move_selection(Some(0), 3, -1), Some(0));
     }
 }

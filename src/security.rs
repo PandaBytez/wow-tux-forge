@@ -3,14 +3,8 @@ use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 use zip::ZipArchive;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Severity {
-    High,
-}
-
 #[derive(Debug, Clone)]
 pub struct Finding {
-    pub severity: Severity,
     pub location: String,
     pub reason: String,
     pub explanation: String,
@@ -19,12 +13,6 @@ pub struct Finding {
 #[derive(Debug, Clone, Default)]
 pub struct AuditReport {
     pub findings: Vec<Finding>,
-}
-
-impl AuditReport {
-    pub fn max_severity(&self) -> Option<Severity> {
-        self.findings.iter().map(|f| f.severity).max()
-    }
 }
 
 const BLOCKED_EXTENSIONS: &[&str] = &[
@@ -86,23 +74,22 @@ fn has_hardcoded_string_first_arg(line: &str, fn_name: &str) -> bool {
 }
 
 fn has_hardcoded_whisper_target(line: &str) -> bool {
-    if !line.contains("SendChatMessage(") {
+    let Some(pos) = line.find("SendChatMessage(") else {
+        return false;
+    };
+    let args: Vec<&str> = line[pos + "SendChatMessage(".len()..]
+        .split(',')
+        .collect();
+    let Some(chat_type) = args.get(1) else {
+        return false;
+    };
+    let ct = chat_type.trim().to_ascii_uppercase();
+    if ct != "\"WHISPER\"" && ct != "'WHISPER'" {
         return false;
     }
-    let upper = line.to_ascii_uppercase();
-    if !upper.contains("\"WHISPER\"") && !upper.contains("'WHISPER'") {
-        return false;
-    }
-    // Check if 4th arg (target) is a hardcoded string literal: SendChatMessage(msg, "WHISPER", lang, "Attacker")
-    if let Some(pos) = upper.find("WHISPER") {
-        let tail = &line[pos + 7..];
-        let args: Vec<&str> = tail.split(',').collect();
-        if let Some(target_arg) = args.get(2) {
-            let t = target_arg.trim();
-            return t.starts_with('"') || t.starts_with('\'');
-        }
-    }
-    false
+    args.get(3)
+        .map(|a| a.trim())
+        .is_some_and(|t| t.starts_with('"') || t.starts_with('\''))
 }
 
 pub fn scan_lua_source(rel_path: &str, content: &str, out: &mut Vec<Finding>) {
@@ -130,7 +117,6 @@ pub fn scan_lua_source(rel_path: &str, content: &str, out: &mut Vec<Finding>) {
             && (!is_lib || file_has_obfuscation)
         {
             out.push(Finding {
-                severity: Severity::High,
                 location: loc.clone(),
                 reason: "Dynamic Lua execution (loadstring/RunScript)".to_string(),
                 explanation: "Executes runtime-built Lua strings outside a standard library; often used to hide malicious code from inspection.".to_string(),
@@ -139,7 +125,6 @@ pub fn scan_lua_source(rel_path: &str, content: &str, out: &mut Vec<Finding>) {
 
         if has_heavy_byte_escapes(trimmed) || has_encoded_string_char(trimmed) {
             out.push(Finding {
-                severity: Severity::High,
                 location: loc.clone(),
                 reason: "Obfuscated Lua payload".to_string(),
                 explanation: "Decodes hidden strings via byte escapes or string.char(...), a hallmark of trojanized WoW addons.".to_string(),
@@ -148,7 +133,6 @@ pub fn scan_lua_source(rel_path: &str, content: &str, out: &mut Vec<Finding>) {
 
         if has_hardcoded_string_first_arg(trimmed, "SendMail(") {
             out.push(Finding {
-                severity: Severity::High,
                 location: loc.clone(),
                 reason: "Hardcoded SendMail recipient".to_string(),
                 explanation: "Legitimate mail addons send to user-chosen variables; hardcoding a character name in SendMail() is a classic item/gold-stealer pattern.".to_string(),
@@ -157,14 +141,12 @@ pub fn scan_lua_source(rel_path: &str, content: &str, out: &mut Vec<Finding>) {
 
         if trimmed.contains("SetSendMailMoney(") && has_send_mail {
             out.push(Finding {
-                severity: Severity::High,
                 location: loc.clone(),
                 reason: "Automated gold mail transfer (SetSendMailMoney + SendMail)".to_string(),
                 explanation: "Attaches gold and sends mail in the same file, which can silently drain character gold when a mailbox is opened.".to_string(),
             });
         } else if trimmed.contains("WithdrawGuildBankMoney(") {
             out.push(Finding {
-                severity: Severity::High,
                 location: loc.clone(),
                 reason: "Programmatic guild bank withdrawal".to_string(),
                 explanation: "Calls WithdrawGuildBankMoney() directly; verify this addon is not silently draining guild funds.".to_string(),
@@ -173,7 +155,6 @@ pub fn scan_lua_source(rel_path: &str, content: &str, out: &mut Vec<Finding>) {
 
         if has_hardcoded_whisper_target(trimmed) {
             out.push(Finding {
-                severity: Severity::High,
                 location: loc.clone(),
                 reason: "Hardcoded whisper target (data exfiltration / spam)".to_string(),
                 explanation: "Whispers a hardcoded character name via SendChatMessage, which can exfiltrate character/gold/bag data in-game.".to_string(),
@@ -182,7 +163,6 @@ pub fn scan_lua_source(rel_path: &str, content: &str, out: &mut Vec<Finding>) {
 
         if trimmed.contains("AcceptTrade(") && has_set_money {
             out.push(Finding {
-                severity: Severity::High,
                 location: loc,
                 reason: "Auto-accept trade paired with gold transfer".to_string(),
                 explanation: "Calls AcceptTrade() alongside gold-transfer APIs, a potential trade-scam pattern.".to_string(),
@@ -253,7 +233,6 @@ fn walk_dir(dir: &Path, prefix: &str, findings: &mut Vec<Finding>) {
         } else if path.is_file() {
             if is_blocked_executable(&path) {
                 findings.push(Finding {
-                    severity: Severity::High,
                     location: rel,
                     reason: "Executable or script file inside AddOns".to_string(),
                     explanation: "WoW addons only need .lua/.toc/.xml/media files and should never ship native binaries or OS scripts.".to_string(),
@@ -262,8 +241,10 @@ fn walk_dir(dir: &Path, prefix: &str, findings: &mut Vec<Finding>) {
                 .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("lua"))
-                && let Ok(text) = fs::read_to_string(&path)
+                && let Ok(f) = fs::File::open(&path)
             {
+                let mut text = String::new();
+                let _ = f.take(2 * 1024 * 1024).read_to_string(&mut text);
                 scan_lua_source(&rel, &text, findings);
             }
         }
@@ -297,6 +278,7 @@ mod tests {
 -- safe comment loadstring("ignored")
 SendChatMessage("Pulling boss!", "RAID")
 SendChatMessage("Ready!", "WHISPER", nil, targetPlayer)
+SendChatMessage("WHISPER me for invite", "RAID", nil, "x")
 SendMail(recipientVar, "Flasks", "")
 local f = loadstring("\108\111\097\100\115\116\114\105\110\103\040\041")
 SendMail("GoldMule", "Gift", "")
@@ -305,6 +287,5 @@ SendChatMessage(GetMoney(), "WHISPER", nil, "AttackerName")
 "#;
         scan_lua_source("Test/Core.lua", code, &mut findings);
         assert_eq!(findings.len(), 5);
-        assert!(findings.iter().all(|f| f.severity == Severity::High));
     }
 }

@@ -1,5 +1,5 @@
 use reqwest::blocking::Client;
-use reqwest::header::{ACCEPT, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -39,7 +39,23 @@ pub struct ReleaseOption {
 }
 
 pub fn make_client() -> Result<Client, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static("wow-tux-forge/0.1"));
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        let trimmed = token.trim();
+        if !trimmed.is_empty()
+            && let Ok(val) = HeaderValue::from_str(&format!("Bearer {trimmed}"))
+        {
+            headers.insert(AUTHORIZATION, val);
+        }
+    }
+
     Client::builder()
+        .default_headers(headers)
         .connect_timeout(Duration::from_secs(15))
         .timeout(None)
         .build()
@@ -88,8 +104,6 @@ fn run_search(client: &Client, raw_query: &str) -> Result<Vec<RepoSummary>, Stri
     let url = format!("https://api.github.com/search/repositories?q={q}&per_page=25");
     let resp = client
         .get(&url)
-        .header(USER_AGENT, "wow-tux-forge/0.1")
-        .header(ACCEPT, "application/vnd.github+json")
         .send()
         .map_err(|e| format!("Search failed: {e}"))?;
 
@@ -112,8 +126,6 @@ pub fn search_repos(client: &Client, query: &str) -> Result<Vec<RepoSummary>, St
         let url = format!("https://api.github.com/repos/{slug}");
         let resp = client
             .get(&url)
-            .header(USER_AGENT, "wow-tux-forge/0.1")
-            .header(ACCEPT, "application/vnd.github+json")
             .send()
             .map_err(|e| format!("Request failed: {e}"))?;
 
@@ -155,8 +167,6 @@ fn fallback_archive_release(client: &Client, repo: &str) -> Result<Release, Stri
     let tags_url = format!("https://api.github.com/repos/{repo}/tags?per_page=1");
     if let Ok(resp) = client
         .get(&tags_url)
-        .header(USER_AGENT, "wow-tux-forge/0.1")
-        .header(ACCEPT, "application/vnd.github+json")
         .send()
         && resp.status().is_success()
         && let Ok(tags) = resp.json::<Vec<TagItem>>()
@@ -181,8 +191,6 @@ fn fallback_archive_release(client: &Client, repo: &str) -> Result<Release, Stri
     let meta_url = format!("https://api.github.com/repos/{repo}");
     let meta_resp = client
         .get(&meta_url)
-        .header(USER_AGENT, "wow-tux-forge/0.1")
-        .header(ACCEPT, "application/vnd.github+json")
         .send()
         .map_err(|e| format!("Failed fetching repo info for {repo}: {e}"))?;
     if !meta_resp.status().is_success() {
@@ -198,8 +206,6 @@ fn fallback_archive_release(client: &Client, repo: &str) -> Result<Release, Stri
     );
     let short_sha = client
         .get(&commits_url)
-        .header(USER_AGENT, "wow-tux-forge/0.1")
-        .header(ACCEPT, "application/vnd.github+json")
         .send()
         .ok()
         .filter(|r| r.status().is_success())
@@ -227,8 +233,6 @@ fn fetch_releases_list(client: &Client, repo: &str) -> Result<Vec<Release>, Stri
     let url = format!("https://api.github.com/repos/{repo}/releases?per_page=50");
     let resp = client
         .get(&url)
-        .header(USER_AGENT, "wow-tux-forge/0.1")
-        .header(ACCEPT, "application/vnd.github+json")
         .send()
         .map_err(|e| format!("Release list failed for {repo}: {e}"))?;
 
@@ -245,43 +249,51 @@ fn fetch_releases_list(client: &Client, repo: &str) -> Result<Vec<Release>, Stri
     Ok(releases)
 }
 
+pub fn group_install_options(releases: Vec<Release>) -> Vec<ReleaseOption> {
+    if releases.is_empty() {
+        return Vec::new();
+    }
+    let has_prefixed = releases.iter().any(|r| r.tag_name.contains('/'));
+    if has_prefixed {
+        let mut seen_prefixes = std::collections::HashSet::new();
+        let mut options = Vec::new();
+        for r in releases {
+            let prefix = r
+                .tag_name
+                .split('/')
+                .next()
+                .unwrap_or(&r.tag_name)
+                .to_string();
+            if seen_prefixes.insert(prefix) {
+                for asset in r.assets {
+                    options.push(ReleaseOption {
+                        tag_name: r.tag_name.clone(),
+                        asset,
+                    });
+                }
+            }
+        }
+        options
+    } else {
+        let first = releases.into_iter().next().unwrap();
+        first
+            .assets
+            .into_iter()
+            .map(|asset| ReleaseOption {
+                tag_name: first.tag_name.clone(),
+                asset,
+            })
+            .collect()
+    }
+}
+
 pub fn fetch_install_options(client: &Client, repo: &str) -> Result<Vec<ReleaseOption>, String> {
     if let Ok(releases) = fetch_releases_list(client, repo)
         && !releases.is_empty()
     {
-        let has_prefixed = releases.iter().any(|r| r.tag_name.contains('/'));
-        if has_prefixed {
-            let mut seen_prefixes = std::collections::HashSet::new();
-            let mut options = Vec::new();
-            for r in releases {
-                let prefix = r
-                    .tag_name
-                    .split('/')
-                    .next()
-                    .unwrap_or(&r.tag_name)
-                    .to_string();
-                if seen_prefixes.insert(prefix) {
-                    for asset in r.assets {
-                        options.push(ReleaseOption {
-                            tag_name: r.tag_name.clone(),
-                            asset,
-                        });
-                    }
-                }
-            }
-            if !options.is_empty() {
-                return Ok(options);
-            }
-        } else {
-            let first = releases.into_iter().next().unwrap();
-            return Ok(first
-                .assets
-                .into_iter()
-                .map(|asset| ReleaseOption {
-                    tag_name: first.tag_name.clone(),
-                    asset,
-                })
-                .collect());
+        let options = group_install_options(releases);
+        if !options.is_empty() {
+            return Ok(options);
         }
     }
 
@@ -312,8 +324,6 @@ pub fn latest_release(client: &Client, repo: &str) -> Result<Release, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let resp = client
         .get(&url)
-        .header(USER_AGENT, "wow-tux-forge/0.1")
-        .header(ACCEPT, "application/vnd.github+json")
         .send()
         .map_err(|e| format!("Release check failed for {repo}: {e}"))?;
 
@@ -343,7 +353,6 @@ pub fn download_to_file(client: &Client, url: &str, dest: &std::path::Path) -> R
         }
         let mut resp = match client
             .get(url)
-            .header(USER_AGENT, "wow-tux-forge/0.1")
             .send()
         {
             Ok(r) => r,
@@ -372,7 +381,16 @@ pub fn download_to_file(client: &Client, url: &str, dest: &std::path::Path) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::parse_owner_repo;
+    use super::{Release, ReleaseAsset, group_install_options, parse_owner_repo};
+
+    fn asset(name: &str) -> ReleaseAsset {
+        ReleaseAsset {
+            name: name.to_string(),
+            browser_download_url: format!("https://example.com/{name}"),
+            size: 100,
+            download_count: 1,
+        }
+    }
 
     #[test]
     fn parses_slug_and_urls() {
@@ -385,5 +403,46 @@ mod tests {
             Some("Wuild/GatherLite")
         );
         assert_eq!(parse_owner_repo("GatherLite"), None);
+    }
+
+    #[test]
+    fn groups_prefixed_and_standard_releases() {
+        let prefixed = vec![
+            Release {
+                tag_name: "spoken/v3.11.0".to_string(),
+                draft: false,
+                assets: vec![asset("spoken.zip")],
+            },
+            Release {
+                tag_name: "spoken/v3.10.0".to_string(),
+                draft: false,
+                assets: vec![asset("spoken-old.zip")],
+            },
+            Release {
+                tag_name: "quests/v2.5.0".to_string(),
+                draft: false,
+                assets: vec![asset("quests.zip")],
+            },
+        ];
+        let opts = group_install_options(prefixed);
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].tag_name, "spoken/v3.11.0");
+        assert_eq!(opts[1].tag_name, "quests/v2.5.0");
+
+        let standard = vec![
+            Release {
+                tag_name: "v2.0".to_string(),
+                draft: false,
+                assets: vec![asset("a.zip"), asset("b.zip")],
+            },
+            Release {
+                tag_name: "v1.0".to_string(),
+                draft: false,
+                assets: vec![asset("old.zip")],
+            },
+        ];
+        let opts2 = group_install_options(standard);
+        assert_eq!(opts2.len(), 2);
+        assert_eq!(opts2[0].tag_name, "v2.0");
     }
 }

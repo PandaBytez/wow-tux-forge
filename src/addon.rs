@@ -188,6 +188,8 @@ pub fn extract_addon_zip_reader<R: Read + Seek>(
     };
 
     let mut top_folders = BTreeSet::new();
+    const MAX_EXTRACT_BYTES: u64 = 256 * 1024 * 1024;
+    let mut total_written = 0u64;
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| format!("Zip read error: {e}"))?;
@@ -241,8 +243,13 @@ pub fn extract_addon_zip_reader<R: Read + Seek>(
             }
             let mut out = fs::File::create(&dest)
                 .map_err(|e| format!("Failed creating file {}: {e}", dest.display()))?;
-            io::copy(&mut file, &mut out)
+            let remaining = MAX_EXTRACT_BYTES.saturating_sub(total_written);
+            let n = io::copy(&mut file.by_ref().take(remaining + 1), &mut out)
                 .map_err(|e| format!("Failed writing file {}: {e}", dest.display()))?;
+            total_written += n;
+            if total_written > MAX_EXTRACT_BYTES {
+                return Err("Zip exceeds maximum allowed extracted size (256 MB)".to_string());
+            }
         }
     }
 
