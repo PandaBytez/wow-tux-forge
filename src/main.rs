@@ -152,6 +152,19 @@ impl App {
         };
         app.refresh_local_addons();
         if !needs_path {
+            let addons_path = Path::new(&app.config.addons_path);
+            let mut backfilled = false;
+            for entry in app.state.addons.values_mut() {
+                if entry.installed_at.is_none()
+                    && let Some(ts) = folder_mtime_unix(addons_path, &entry.folders)
+                {
+                    entry.installed_at = Some(ts);
+                    backfilled = true;
+                }
+            }
+            if backfilled {
+                let _ = storage::save_state(&app.state);
+            }
             app.status = format!(
                 "Loaded {} GitHub addon(s), {} local addon folder(s).",
                 app.state.addons.len(),
@@ -435,6 +448,7 @@ impl App {
 
         self.busy = true;
         self.status = format!("Linking {} local addon(s) via .toc GitHub URLs...", hinted.len());
+        let addons_dir = self.config.addons_path.clone();
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
 
@@ -461,15 +475,19 @@ impl App {
                 by_repo.into_iter().collect(),
                 6,
                 |(repo, (folders, local_ver))| match github::latest_release(&client, &repo) {
-                    Ok(rel) if !rel.assets.is_empty() => Ok((
-                        repo,
-                        InstalledAddon {
-                            tag: local_ver.unwrap_or_else(|| "local".to_string()),
-                            asset_name: rel.assets[0].name.clone(),
-                            folders,
-                            installed_at: Some(now_unix_secs()),
-                        },
-                    )),
+                    Ok(rel) if !rel.assets.is_empty() => {
+                        let installed_at = folder_mtime_unix(Path::new(&addons_dir), &folders)
+                            .or_else(|| Some(now_unix_secs()));
+                        Ok((
+                            repo,
+                            InstalledAddon {
+                                tag: local_ver.unwrap_or_else(|| "local".to_string()),
+                                asset_name: rel.assets[0].name.clone(),
+                                folders,
+                                installed_at,
+                            },
+                        ))
+                    }
                     _ => Err(()),
                 },
             );
@@ -1835,6 +1853,16 @@ fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn folder_mtime_unix(addons_dir: &Path, folders: &[String]) -> Option<u64> {
+    folders
+        .iter()
+        .filter_map(|f| std::fs::metadata(addons_dir.join(f)).ok())
+        .filter_map(|m| m.modified().ok())
+        .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .max()
 }
 
 fn format_relative_diff(diff: i64) -> String {
