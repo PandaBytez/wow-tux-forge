@@ -1,6 +1,7 @@
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -38,6 +39,29 @@ pub struct ReleaseOption {
     pub asset: ReleaseAsset,
 }
 
+fn resolve_github_token() -> Option<String> {
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        let trimmed = token.trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+    static GH_CLI_TOKEN: OnceLock<Option<String>> = OnceLock::new();
+    GH_CLI_TOKEN
+        .get_or_init(|| {
+            let out = std::process::Command::new("gh")
+                .args(["auth", "token"])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (!tok.is_empty()).then_some(tok)
+        })
+        .clone()
+}
+
 pub fn make_client() -> Result<Client, String> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static("wow-tux-forge/0.1"));
@@ -45,13 +69,10 @@ pub fn make_client() -> Result<Client, String> {
         ACCEPT,
         HeaderValue::from_static("application/vnd.github+json"),
     );
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let trimmed = token.trim();
-        if !trimmed.is_empty()
-            && let Ok(val) = HeaderValue::from_str(&format!("Bearer {trimmed}"))
-        {
-            headers.insert(AUTHORIZATION, val);
-        }
+    if let Some(token) = resolve_github_token()
+        && let Ok(val) = HeaderValue::from_str(&format!("Bearer {token}"))
+    {
+        headers.insert(AUTHORIZATION, val);
     }
 
     Client::builder()
@@ -237,6 +258,9 @@ fn fetch_releases_list(client: &Client, repo: &str) -> Result<Vec<Release>, Stri
         .map_err(|e| format!("Release list failed for {repo}: {e}"))?;
 
     if !resp.status().is_success() {
+        if resp.status() == reqwest::StatusCode::FORBIDDEN {
+            return Err("403 rate limited (set GITHUB_TOKEN or login with gh)".to_string());
+        }
         return Err(format!("GitHub returned {} for {repo}", resp.status()));
     }
 
@@ -331,6 +355,9 @@ pub fn latest_release(client: &Client, repo: &str) -> Result<Release, String> {
         return fallback_archive_release(client, repo);
     }
     if !resp.status().is_success() {
+        if resp.status() == reqwest::StatusCode::FORBIDDEN {
+            return Err("403 rate limited (set GITHUB_TOKEN or login with gh)".to_string());
+        }
         return Err(format!("GitHub returned {} for {repo}", resp.status()));
     }
 
