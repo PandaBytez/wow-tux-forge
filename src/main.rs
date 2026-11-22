@@ -460,12 +460,13 @@ impl App {
                     continue;
                 }
 
-                let asset = release
-                    .assets
-                    .iter()
-                    .find(|a| a.name == current.asset_name)
-                    .or_else(|| release.assets.first())
-                    .cloned();
+                let asset = pick_matching_asset(
+                    &release.assets,
+                    &current.asset_name,
+                    &current.tag,
+                    &release.tag_name,
+                )
+                .cloned();
 
                 let Some(asset) = asset else {
                     errors.push(format!("{repo}: no .zip asset in {}", release.tag_name));
@@ -1297,6 +1298,33 @@ fn load_finding_snippet_from_zip(zip_path: &Path, location: &str) -> Result<Snip
         .by_name(rel)
         .map_err(|e| format!("File {rel} not found in zip: {e}"))?;
     Ok(extract_snippet_lines(io::BufReader::new(entry), location, target_line))
+}
+
+fn pick_matching_asset<'a>(
+    assets: &'a [ReleaseAsset],
+    current_name: &str,
+    old_tag: &str,
+    new_tag: &str,
+) -> Option<&'a ReleaseAsset> {
+    if let Some(exact) = assets.iter().find(|a| a.name == current_name) {
+        return Some(exact);
+    }
+    let old_nov = old_tag.trim_start_matches('v');
+    let new_nov = new_tag.trim_start_matches('v');
+    let expected_with_tag = current_name.replace(old_tag, new_tag);
+    let expected_nov = (!old_nov.is_empty()).then(|| current_name.replace(old_nov, new_nov));
+    if let Some(m) = assets.iter().find(|a| {
+        a.name == expected_with_tag
+            || expected_nov.as_ref().is_some_and(|e| a.name == *e)
+    }) {
+        return Some(m);
+    }
+    if let Some((_, suffix)) = current_name.rsplit_once('-')
+        && let Some(m) = assets.iter().find(|a| a.name.ends_with(&format!("-{suffix}")))
+    {
+        return Some(m);
+    }
+    assets.first()
 }
 
 fn cache_temp_zip(kind: &str) -> PathBuf {
@@ -2184,7 +2212,8 @@ fn relative_time_ago_from(iso: &str, now_secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        install_state_key, load_finding_snippet, move_selection, relative_time_ago_from, wrap_text,
+        ReleaseAsset, install_state_key, load_finding_snippet, move_selection,
+        pick_matching_asset, relative_time_ago_from, wrap_text,
     };
 
     #[test]
@@ -2229,5 +2258,28 @@ mod tests {
         assert!(load_finding_snippet(&tmp, "MyAddon/payload.exe").is_err());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn picks_matching_flavor_asset_on_update() {
+        let mk = |name: &str| ReleaseAsset {
+            name: name.to_string(),
+            browser_download_url: String::new(),
+            size: 0,
+            download_count: 0,
+        };
+        let assets = vec![
+            mk("TrainerSpells-v1.1.26-bcc.zip"),
+            mk("TrainerSpells-v1.1.26-classic.zip"),
+            mk("TrainerSpells-v1.1.26-forever.zip"),
+        ];
+        let picked = pick_matching_asset(
+            &assets,
+            "TrainerSpells-v1.1.25-forever.zip",
+            "v1.1.25",
+            "v1.1.26",
+        )
+        .unwrap();
+        assert_eq!(picked.name, "TrainerSpells-v1.1.26-forever.zip");
     }
 }
