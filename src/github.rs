@@ -167,6 +167,11 @@ pub fn search_repos(client: &Client, query: &str) -> Result<Vec<RepoSummary>, St
 }
 
 #[derive(Debug, Deserialize)]
+struct TagItem {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct RepoMeta {
     default_branch: String,
 }
@@ -176,16 +181,17 @@ struct CommitItem {
     sha: String,
 }
 
-fn fallback_archive_release(client: &Client, repo: &str) -> Result<Release, String> {
+fn default_branch_release(client: &Client, repo: &str) -> Result<Release, String> {
     let repo_name = repo.split('/').nth(1).unwrap_or(repo);
-
-    // Fall back to default branch (main/master) latest commit zipball.
     let meta_url = format!("https://api.github.com/repos/{repo}");
     let meta_resp = client
         .get(&meta_url)
         .send()
         .map_err(|e| format!("Failed fetching repo info for {repo}: {e}"))?;
     if !meta_resp.status().is_success() {
+        if meta_resp.status() == reqwest::StatusCode::FORBIDDEN {
+            return Err("403 rate limited (set GITHUB_TOKEN or login with gh)".to_string());
+        }
         return Err(format!("GitHub returned {} for {repo}", meta_resp.status()));
     }
     let meta: RepoMeta = meta_resp
@@ -219,6 +225,43 @@ fn fallback_archive_release(client: &Client, repo: &str) -> Result<Release, Stri
             download_count: 0,
         }],
     })
+}
+
+fn fetch_tags_list(client: &Client, repo: &str, per_page: usize) -> Vec<Release> {
+    let repo_name = repo.split('/').nth(1).unwrap_or(repo);
+    let tags_url = format!("https://api.github.com/repos/{repo}/tags?per_page={per_page}");
+    let Ok(resp) = client.get(&tags_url).send() else {
+        return Vec::new();
+    };
+    if !resp.status().is_success() {
+        return Vec::new();
+    }
+    let Ok(tags) = resp.json::<Vec<TagItem>>() else {
+        return Vec::new();
+    };
+    tags.into_iter()
+        .map(|tag| Release {
+            tag_name: tag.name.clone(),
+            draft: false,
+            assets: vec![ReleaseAsset {
+                name: format!("{repo_name}-{}.zip", tag.name),
+                browser_download_url: format!(
+                    "https://api.github.com/repos/{repo}/zipball/{}",
+                    percent_encode(&tag.name)
+                ),
+                size: 0,
+                download_count: 0,
+            }],
+        })
+        .collect()
+}
+
+fn fallback_archive_release(client: &Client, repo: &str) -> Result<Release, String> {
+    // Release -> tag -> main/master order.
+    if let Some(tag_rel) = fetch_tags_list(client, repo, 1).into_iter().next() {
+        return Ok(tag_rel);
+    }
+    default_branch_release(client, repo)
 }
 
 fn fetch_releases_list(client: &Client, repo: &str) -> Result<Vec<Release>, String> {
@@ -265,6 +308,28 @@ pub fn fetch_install_options(client: &Client, repo: &str) -> Result<Vec<ReleaseO
         if !options.is_empty() {
             return Ok(options);
         }
+    }
+
+    // No GitHub Releases: offer both tags and default branch (main/master) in the picker.
+    let mut options = Vec::new();
+    for rel in fetch_tags_list(client, repo, 10) {
+        for asset in rel.assets {
+            options.push(ReleaseOption {
+                tag_name: rel.tag_name.clone(),
+                asset,
+            });
+        }
+    }
+    if let Ok(branch_rel) = default_branch_release(client, repo) {
+        for asset in branch_rel.assets {
+            options.push(ReleaseOption {
+                tag_name: branch_rel.tag_name.clone(),
+                asset,
+            });
+        }
+    }
+    if !options.is_empty() {
+        return Ok(options);
     }
 
     let rel = latest_release(client, repo)?;
