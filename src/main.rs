@@ -359,7 +359,16 @@ impl App {
                 return;
             }
         }
-        let repos = self.installed_keys();
+        let repos: Vec<String> = self
+            .state
+            .addons
+            .iter()
+            .filter(|(_, a)| !a.pinned)
+            .map(|(k, _)| k.clone())
+            .collect();
+        if repos.is_empty() {
+            return;
+        }
         self.busy = true;
         self.status = format!("Checking updates for {} addon(s)...", repos.len());
         let (tx, rx) = mpsc::channel();
@@ -396,9 +405,12 @@ impl App {
             .state
             .addons
             .iter()
-            .filter(|(repo, current)| match self.latest_tags.get(*repo) {
-                Some(Ok(latest)) => latest != &current.tag,
-                Some(Err(_)) | None => self.latest_tags.is_empty(),
+            .filter(|(repo, current)| {
+                !current.pinned
+                    && match self.latest_tags.get(*repo) {
+                        Some(Ok(latest)) => latest != &current.tag,
+                        Some(Err(_)) | None => self.latest_tags.is_empty(),
+                    }
             })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -552,6 +564,7 @@ impl App {
                                 asset_name: rel.assets[0].name.clone(),
                                 folders,
                                 installed_at,
+                                pinned: false,
                             },
                         ))
                     }
@@ -967,6 +980,7 @@ impl App {
                                 asset_name: pending.asset_name,
                                 folders,
                                 installed_at: Some(now_unix_secs()),
+                                pinned: false,
                             };
                             self.latest_tags
                                 .insert(pending.state_key.clone(), Ok(pending.tag));
@@ -1157,6 +1171,25 @@ impl App {
                 KeyCode::Char('d') => {
                     if !self.busy {
                         self.prompt_delete_selected();
+                    }
+                }
+                KeyCode::Char('p') => {
+                    if let Some(idx) = self.installed_list_state.selected()
+                        && let Some(repo) = self.installed_keys().get(idx).cloned()
+                        && let Some(entry) = self.state.addons.get_mut(&repo)
+                    {
+                        entry.pinned = !entry.pinned;
+                        let pinned = entry.pinned;
+                        let tag = entry.tag.clone();
+                        if let Err(e) = storage::save_state(&self.state) {
+                            self.status = e;
+                        } else {
+                            self.status = if pinned {
+                                format!("Pinned {repo} at {tag} (updates skipped).")
+                            } else {
+                                format!("Unpinned {repo}.")
+                            };
+                        }
                     }
                 }
                 _ => {}
@@ -1351,6 +1384,7 @@ fn download_and_audit_zip(
         asset_name: asset_name.to_string(),
         folders,
         installed_at: Some(now_unix_secs()),
+        pinned: false,
     }))
 }
 
@@ -1559,18 +1593,22 @@ fn draw(f: &mut Frame, app: &mut App) {
         Tab::Installed => {
             let mut rows: Vec<Row> = Vec::new();
             for (repo, info) in &app.state.addons {
-                let status_cell = match app.latest_tags.get(repo) {
-                    Some(Ok(latest)) if latest != &info.tag => Cell::from(Span::styled(
-                        format!("⬆ Update: {latest}"),
-                        Style::default().fg(emerald).add_modifier(Modifier::BOLD),
-                    )),
-                    Some(Ok(_)) => {
-                        Cell::from(Span::styled("✓ Up to date", Style::default().fg(dim)))
+                let status_cell = if info.pinned {
+                    Cell::from(Span::styled("📌 Pinned", Style::default().fg(gold)))
+                } else {
+                    match app.latest_tags.get(repo) {
+                        Some(Ok(latest)) if latest != &info.tag => Cell::from(Span::styled(
+                            format!("⬆ Update: {latest}"),
+                            Style::default().fg(emerald).add_modifier(Modifier::BOLD),
+                        )),
+                        Some(Ok(_)) => {
+                            Cell::from(Span::styled("✓ Up to date", Style::default().fg(dim)))
+                        }
+                        Some(Err(e)) => {
+                            Cell::from(Span::styled(format!("✖ {e}"), Style::default().fg(Color::Red)))
+                        }
+                        None => Cell::from(Span::styled("• GitHub (not checked)", Style::default().fg(dim))),
                     }
-                    Some(Err(e)) => {
-                        Cell::from(Span::styled(format!("✖ {e}"), Style::default().fg(Color::Red)))
-                    }
-                    None => Cell::from(Span::styled("• GitHub (not checked)", Style::default().fg(dim))),
                 };
                 let installed_ago = info
                     .installed_at
@@ -1758,6 +1796,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("l", "Link GitHub"),
             ("a", "Security Audit"),
             ("s", "Scan"),
+            ("p", "Pin"),
             ("d", "Remove"),
             ("c", "Path"),
             ("Tab", "Search"),

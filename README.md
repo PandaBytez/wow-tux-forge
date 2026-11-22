@@ -39,6 +39,7 @@ Run `wow-tux-forge` and press `c` on first launch to set your WoW `Interface/Add
 | `l` | Link local addons from `.toc` GitHub URLs (Installed) |
 | `a` | Security audit all addons (Installed) |
 | `s` | Security audit selected addon (Installed) |
+| `p` | Pin/unpin selected addon version (Installed) |
 | `d` | Delete selected addon (Installed) |
 | `Enter` / `i` | Install/reinstall selected addon (Search) or confirm |
 | `/` | Focus search input (Search) |

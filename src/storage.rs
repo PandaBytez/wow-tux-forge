@@ -16,6 +16,8 @@ pub struct InstalledAddon {
     pub folders: Vec<String>,
     #[serde(default)]
     pub installed_at: Option<u64>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -89,6 +91,7 @@ mod tests {
                 asset_name: "Bar.zip".to_string(),
                 folders: vec!["Bar".to_string()],
                 installed_at: Some(1_795_348_800),
+                pinned: false,
             },
         );
         save_json(&tmp, &state).unwrap();
