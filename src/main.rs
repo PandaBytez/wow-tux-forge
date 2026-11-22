@@ -359,12 +359,12 @@ impl App {
                 return;
             }
         }
-        let repos: Vec<String> = self
+        let repos: Vec<(String, String)> = self
             .state
             .addons
             .iter()
             .filter(|(_, a)| !a.pinned)
-            .map(|(k, _)| k.clone())
+            .map(|(k, a)| (k.clone(), a.tag.clone()))
             .collect();
         if repos.is_empty() {
             return;
@@ -376,11 +376,11 @@ impl App {
 
         thread::spawn(move || {
             let results = match github::make_client() {
-                Ok(client) => map_parallel(repos, 6, |repo| {
-                    let res = github::latest_release_for_key(&client, &repo);
+                Ok(client) => map_parallel(repos, 6, |(repo, cur_tag)| {
+                    let res = github::latest_release_for_key(&client, &repo, &cur_tag);
                     (repo, res)
                 }),
-                Err(e) => repos.into_iter().map(|r| (r, Err(e.clone()))).collect(),
+                Err(e) => repos.into_iter().map(|(r, _)| (r, Err(e.clone()))).collect(),
             };
             let _ = tx.send(BgResult::CheckUpdatesDone(results));
         });
@@ -447,7 +447,7 @@ impl App {
 
             let addons_path = Path::new(&addons_dir);
             for (idx, (repo, current)) in tracked.into_iter().enumerate() {
-                let release = match github::latest_release_for_key(&client, &repo) {
+                let release = match github::latest_release_for_key(&client, &repo, &current.tag) {
                     Ok(r) => r,
                     Err(e) => {
                         errors.push(format!("{repo}: {e}"));

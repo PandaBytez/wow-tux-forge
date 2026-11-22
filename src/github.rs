@@ -343,7 +343,11 @@ pub fn fetch_install_options(client: &Client, repo: &str) -> Result<Vec<ReleaseO
         .collect())
 }
 
-pub fn latest_release_for_key(client: &Client, state_key: &str) -> Result<Release, String> {
+pub fn latest_release_for_key(
+    client: &Client,
+    state_key: &str,
+    current_tag: &str,
+) -> Result<Release, String> {
     if let Some((repo, prefix)) = state_key.split_once('#') {
         let releases = fetch_releases_list(client, repo)?;
         let prefix_slash = format!("{prefix}/");
@@ -351,6 +355,9 @@ pub fn latest_release_for_key(client: &Client, state_key: &str) -> Result<Releas
             .into_iter()
             .find(|r| r.tag_name.starts_with(&prefix_slash))
             .ok_or_else(|| format!("No release found for {state_key}"));
+    }
+    if current_tag.contains('@') {
+        return default_branch_release(client, state_key);
     }
     latest_release(client, state_key)
 }
