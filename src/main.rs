@@ -391,9 +391,26 @@ impl App {
         }
 
         let addons_dir = self.config.addons_path.clone();
-        let tracked = self.state.addons.clone();
+        let total = self.state.addons.len();
+        let tracked: BTreeMap<String, InstalledAddon> = self
+            .state
+            .addons
+            .iter()
+            .filter(|(repo, current)| match self.latest_tags.get(*repo) {
+                Some(Ok(latest)) => latest != &current.tag,
+                Some(Err(_)) | None => self.latest_tags.is_empty(),
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        if tracked.is_empty() {
+            self.status = format!("All {total} addon(s) are already up to date.");
+            return;
+        }
+        let skipped_up_to_date = total - tracked.len();
+
         self.busy = true;
-        self.status = format!("Checking and updating {} addon(s)...", tracked.len());
+        self.status = format!("Updating {} addon(s)...", tracked.len());
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
 
@@ -401,7 +418,7 @@ impl App {
             let mut updated = Vec::new();
             let mut flagged = Vec::new();
             let mut errors = Vec::new();
-            let mut up_to_date_count = 0usize;
+            let mut up_to_date_count = skipped_up_to_date;
 
             let client = match github::make_client() {
                 Ok(c) => c,
