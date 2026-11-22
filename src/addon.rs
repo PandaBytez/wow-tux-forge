@@ -171,7 +171,12 @@ pub fn extract_addon_zip_reader<R: Read + Seek>(
         }
         if top_dirs.len() == 1 && !root_toc_stems.is_empty() {
             let only_dir = top_dirs.into_iter().next().unwrap();
-            if !root_toc_stems.contains(&only_dir) {
+            let prefix_us = format!("{only_dir}_");
+            let prefix_dash = format!("{only_dir}-");
+            let matches_dir = root_toc_stems
+                .iter()
+                .any(|s| s == &only_dir || s.starts_with(&prefix_us) || s.starts_with(&prefix_dash));
+            if !matches_dir {
                 let primary = root_toc_stems
                     .into_iter()
                     .min_by_key(|s| s.len())
@@ -341,6 +346,15 @@ mod tests {
         assert!(tmp.join("Scrap/Scrap.toc").is_file());
         assert!(tmp.join("Scrap/core/main.lua").is_file());
         assert!(!tmp.join("Jaliborc-Scrap-a1b2c3d").exists());
+
+        // Multi-flavor zip without a bare Addon.toc (like TrainerSpells/TrainerSpells_TBC.toc)
+        let z4 = build_zip(&[
+            ("TrainerSpells/TrainerSpells_TBC.toc", b"## Title: TS\n"),
+            ("TrainerSpells/TrainerSpells_Camelot.toc", b"## Title: TS\n"),
+        ]);
+        let folders4 = extract_addon_zip(&z4, &tmp).unwrap();
+        assert_eq!(folders4, vec!["TrainerSpells"]);
+        assert!(tmp.join("TrainerSpells/TrainerSpells_TBC.toc").is_file());
 
         let _ = fs::remove_dir_all(&tmp);
     }
