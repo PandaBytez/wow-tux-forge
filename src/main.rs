@@ -18,9 +18,9 @@ use ratatui::widgets::{
     TableState, Tabs, Wrap,
 };
 use ratatui::{Frame, Terminal};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
@@ -43,11 +43,13 @@ enum BgResult {
     ReleaseForInstall(String, Result<Vec<ReleaseOption>, String>),
     InstallBatchDone {
         installed: Vec<(String, InstalledAddon)>,
+        flagged: Vec<(PendingInstall, security::AuditReport)>,
         errors: Vec<String>,
     },
     CheckUpdatesDone(Vec<(String, Result<Release, String>)>),
     UpdateAllDone {
         updated: Vec<(String, InstalledAddon)>,
+        flagged: Vec<(PendingInstall, security::AuditReport)>,
         errors: Vec<String>,
         up_to_date_count: usize,
     },
@@ -74,11 +76,20 @@ struct SnippetPreview {
     lines: Vec<(usize, String)>,
 }
 
+struct PendingInstall {
+    state_key: String,
+    tag: String,
+    asset_name: String,
+    tmp_zip: PathBuf,
+    old_folders: Vec<String>,
+}
+
 struct AuditModal {
     title: String,
     report: security::AuditReport,
     state: ListState,
     snippet: Option<SnippetPreview>,
+    pending_install: Option<PendingInstall>,
 }
 
 struct ConfirmDelete {
@@ -103,6 +114,7 @@ struct App {
     path_input: String,
     asset_picker: Option<AssetPicker>,
     audit_modal: Option<AuditModal>,
+    pending_audits: VecDeque<(PendingInstall, security::AuditReport)>,
     confirm_delete: Option<ConfirmDelete>,
 
     status: String,
@@ -144,6 +156,7 @@ impl App {
             path_input,
             asset_picker: None,
             audit_modal: None,
+            pending_audits: VecDeque::new(),
             confirm_delete: None,
             status,
             busy: false,
@@ -272,6 +285,7 @@ impl App {
 
         thread::spawn(move || {
             let mut installed = Vec::new();
+            let mut flagged = Vec::new();
             let mut errors = Vec::new();
 
             let client = match github::make_client() {
@@ -279,6 +293,7 @@ impl App {
                 Err(e) => {
                     let _ = tx.send(BgResult::InstallBatchDone {
                         installed,
+                        flagged,
                         errors: vec![e],
                     });
                     return;
@@ -286,29 +301,39 @@ impl App {
             };
 
             let addons_path = Path::new(&addons_dir);
-            let tmp_zip = cache_temp_zip("install");
-            for ((state_key, tag, asset), old_folders) in items.into_iter().zip(existing_folders) {
-                let res = install_asset_to_addons(
+            for (idx, ((state_key, tag, asset), old_folders)) in
+                items.into_iter().zip(existing_folders).enumerate()
+            {
+                let tmp_zip = cache_temp_zip(&format!("install-{idx}"));
+                match download_and_audit_zip(
                     &client,
                     &asset.browser_download_url,
                     addons_path,
-                    &old_folders,
+                    &state_key,
+                    &tag,
+                    &asset.name,
+                    old_folders,
                     &tmp_zip,
-                )
-                .map(|folders| InstalledAddon {
-                    tag,
-                    asset_name: asset.name,
-                    folders,
-                    installed_at: Some(now_unix_secs()),
-                });
-                let _ = std::fs::remove_file(&tmp_zip);
-                match res {
-                    Ok(entry) => installed.push((state_key, entry)),
-                    Err(e) => errors.push(format!("{state_key}: {e}")),
+                ) {
+                    Ok(InstallOutcome::Installed(entry)) => {
+                        let _ = std::fs::remove_file(&tmp_zip);
+                        installed.push((state_key, entry));
+                    }
+                    Ok(InstallOutcome::Flagged(pending, report)) => {
+                        flagged.push((pending, report));
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp_zip);
+                        errors.push(format!("{state_key}: {e}"));
+                    }
                 }
             }
 
-            let _ = tx.send(BgResult::InstallBatchDone { installed, errors });
+            let _ = tx.send(BgResult::InstallBatchDone {
+                installed,
+                flagged,
+                errors,
+            });
         });
     }
 
@@ -356,6 +381,7 @@ impl App {
 
         thread::spawn(move || {
             let mut updated = Vec::new();
+            let mut flagged = Vec::new();
             let mut errors = Vec::new();
             let mut up_to_date_count = 0usize;
 
@@ -364,6 +390,7 @@ impl App {
                 Err(e) => {
                     let _ = tx.send(BgResult::UpdateAllDone {
                         updated,
+                        flagged,
                         errors: vec![e],
                         up_to_date_count,
                     });
@@ -372,8 +399,7 @@ impl App {
             };
 
             let addons_path = Path::new(&addons_dir);
-            let tmp_zip = cache_temp_zip("update");
-            for (repo, current) in tracked {
+            for (idx, (repo, current)) in tracked.into_iter().enumerate() {
                 let release = match github::latest_release_for_key(&client, &repo) {
                     Ok(r) => r,
                     Err(e) => {
@@ -399,28 +425,34 @@ impl App {
                     continue;
                 };
 
-                let res = install_asset_to_addons(
+                let tmp_zip = cache_temp_zip(&format!("update-{idx}"));
+                match download_and_audit_zip(
                     &client,
                     &asset.browser_download_url,
                     addons_path,
-                    &current.folders,
+                    &repo,
+                    &release.tag_name,
+                    &asset.name,
+                    current.folders,
                     &tmp_zip,
-                )
-                .map(|folders| InstalledAddon {
-                    tag: release.tag_name,
-                    asset_name: asset.name,
-                    folders,
-                    installed_at: Some(now_unix_secs()),
-                });
-                let _ = std::fs::remove_file(&tmp_zip);
-                match res {
-                    Ok(new_entry) => updated.push((repo, new_entry)),
-                    Err(e) => errors.push(format!("{repo}: {e}")),
+                ) {
+                    Ok(InstallOutcome::Installed(new_entry)) => {
+                        let _ = std::fs::remove_file(&tmp_zip);
+                        updated.push((repo, new_entry));
+                    }
+                    Ok(InstallOutcome::Flagged(pending, report)) => {
+                        flagged.push((pending, report));
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp_zip);
+                        errors.push(format!("{repo}: {e}"));
+                    }
                 }
             }
 
             let _ = tx.send(BgResult::UpdateAllDone {
                 updated,
+                flagged,
                 errors,
                 up_to_date_count,
             });
@@ -640,13 +672,20 @@ impl App {
             BgResult::ReleaseForInstall(repo, Err(e)) => {
                 self.status = format!("{repo}: {e}");
             }
-            BgResult::InstallBatchDone { installed, errors } => {
+            BgResult::InstallBatchDone {
+                installed,
+                flagged,
+                errors,
+            } => {
                 let installed_count = installed.len();
                 let mut last_key = None;
                 for (key, entry) in installed {
                     self.latest_tags.insert(key.clone(), Ok(entry.tag.clone()));
                     self.state.addons.insert(key.clone(), entry);
                     last_key = Some(key);
+                }
+                for item in flagged {
+                    self.pending_audits.push_back(item);
                 }
                 if let Err(e) = storage::save_state(&self.state) {
                     self.status = e;
@@ -666,6 +705,7 @@ impl App {
                             errors[0]
                         );
                     }
+                    self.open_next_pending_audit();
                 }
             }
             BgResult::CheckUpdatesDone(results) => {
@@ -689,6 +729,7 @@ impl App {
             }
             BgResult::UpdateAllDone {
                 updated,
+                flagged,
                 errors,
                 up_to_date_count,
             } => {
@@ -696,6 +737,9 @@ impl App {
                 for (repo, entry) in updated {
                     self.latest_tags.insert(repo.clone(), Ok(entry.tag.clone()));
                     self.state.addons.insert(repo, entry);
+                }
+                for item in flagged {
+                    self.pending_audits.push_back(item);
                 }
                 self.refresh_local_addons();
                 let save_err = storage::save_state(&self.state).err();
@@ -712,6 +756,7 @@ impl App {
                         errors[0]
                     );
                 }
+                self.open_next_pending_audit();
             }
             BgResult::LinkLocalDone { linked, failed } => {
                 let count = linked.len();
@@ -759,8 +804,33 @@ impl App {
                     report,
                     state,
                     snippet: None,
+                    pending_install: None,
                 });
             }
+        }
+    }
+
+    fn open_next_pending_audit(&mut self) {
+        if self.audit_modal.is_some() {
+            return;
+        }
+        if let Some((pending, report)) = self.pending_audits.pop_front() {
+            let mut state = ListState::default();
+            if !report.findings.is_empty() {
+                state.select(Some(0));
+            }
+            self.status = format!(
+                "Security audit flagged {} ({} finding(s)) — review and press [y] to install or [n] to cancel.",
+                pending.state_key,
+                report.findings.len()
+            );
+            self.audit_modal = Some(AuditModal {
+                title: pending.state_key.clone(),
+                report,
+                state,
+                snippet: None,
+                pending_install: Some(pending),
+            });
         }
     }
 
@@ -833,8 +903,43 @@ impl App {
                 return;
             }
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.audit_modal = None;
+                KeyCode::Char('y') | KeyCode::Char('Y') if modal.pending_install.is_some() => {
+                    let modal = self.audit_modal.take().unwrap();
+                    let pending = modal.pending_install.unwrap();
+                    let addons_path = Path::new(&self.config.addons_path);
+                    let res = extract_staged_zip(&pending.tmp_zip, addons_path, &pending.old_folders);
+                    let _ = std::fs::remove_file(&pending.tmp_zip);
+                    match res {
+                        Ok(folders) => {
+                            let entry = InstalledAddon {
+                                tag: pending.tag.clone(),
+                                asset_name: pending.asset_name,
+                                folders,
+                                installed_at: Some(now_unix_secs()),
+                            };
+                            self.latest_tags
+                                .insert(pending.state_key.clone(), Ok(pending.tag));
+                            self.state.addons.insert(pending.state_key.clone(), entry);
+                            if let Err(e) = storage::save_state(&self.state) {
+                                self.status = e;
+                            } else {
+                                self.refresh_local_addons();
+                                self.status = format!("Installed {} (risk accepted).", pending.state_key);
+                            }
+                        }
+                        Err(e) => {
+                            self.status = format!("{}: {e}", pending.state_key);
+                        }
+                    }
+                    self.open_next_pending_audit();
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    let modal = self.audit_modal.take().unwrap();
+                    if let Some(pending) = modal.pending_install {
+                        let _ = std::fs::remove_file(&pending.tmp_zip);
+                        self.status = format!("Cancelled {} (security audit).", pending.state_key);
+                        self.open_next_pending_audit();
+                    }
                 }
                 KeyCode::Enter => {
                     if modal.report.findings.is_empty() {
@@ -842,10 +947,15 @@ impl App {
                     } else if let Some(idx) = modal.state.selected()
                         && let Some(finding) = modal.report.findings.get(idx)
                     {
-                        match load_finding_snippet(
-                            Path::new(&self.config.addons_path),
-                            &finding.location,
-                        ) {
+                        let res = if let Some(pending) = &modal.pending_install {
+                            load_finding_snippet_from_zip(&pending.tmp_zip, &finding.location)
+                        } else {
+                            load_finding_snippet(
+                                Path::new(&self.config.addons_path),
+                                &finding.location,
+                            )
+                        };
+                        match res {
                             Ok(snip) => modal.snippet = Some(snip),
                             Err(e) => self.status = e,
                         }
@@ -1052,20 +1162,15 @@ impl App {
     }
 }
 
-fn load_finding_snippet(addons_dir: &Path, location: &str) -> Result<SnippetPreview, String> {
-    let Some((rel, line_str)) = location.rsplit_once(':') else {
-        return Err(format!("No line number available for {location}"));
-    };
-    let target_line: usize = line_str
-        .parse()
-        .map_err(|_| format!("Invalid line number in {location}"))?;
-    let file = std::fs::File::open(addons_dir.join(rel))
-        .map_err(|e| format!("Failed opening {rel}: {e}"))?;
-    let reader = io::BufReader::new(file);
+fn extract_snippet_lines<R: io::BufRead>(
+    reader: R,
+    location: &str,
+    target_line: usize,
+) -> SnippetPreview {
     let start = target_line.saturating_sub(6).max(1);
     let end = target_line + 6;
     let mut lines = Vec::new();
-    for (idx, line_res) in io::BufRead::lines(reader).enumerate() {
+    for (idx, line_res) in reader.lines().enumerate() {
         let num = idx + 1;
         if num > end {
             break;
@@ -1074,14 +1179,43 @@ fn load_finding_snippet(addons_dir: &Path, location: &str) -> Result<SnippetPrev
             lines.push((num, line_res.unwrap_or_default()));
         }
     }
-    Ok(SnippetPreview {
+    SnippetPreview {
         title: location.to_string(),
         target_line,
         lines,
-    })
+    }
 }
 
-fn cache_temp_zip(kind: &str) -> std::path::PathBuf {
+fn parse_location(location: &str) -> Result<(&str, usize), String> {
+    let Some((rel, line_str)) = location.rsplit_once(':') else {
+        return Err(format!("No line number available for {location}"));
+    };
+    let target_line: usize = line_str
+        .parse()
+        .map_err(|_| format!("Invalid line number in {location}"))?;
+    Ok((rel, target_line))
+}
+
+fn load_finding_snippet(addons_dir: &Path, location: &str) -> Result<SnippetPreview, String> {
+    let (rel, target_line) = parse_location(location)?;
+    let file = std::fs::File::open(addons_dir.join(rel))
+        .map_err(|e| format!("Failed opening {rel}: {e}"))?;
+    Ok(extract_snippet_lines(io::BufReader::new(file), location, target_line))
+}
+
+fn load_finding_snippet_from_zip(zip_path: &Path, location: &str) -> Result<SnippetPreview, String> {
+    let (rel, target_line) = parse_location(location)?;
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| format!("Failed opening zip: {e}"))?;
+    let mut archive = zip::ZipArchive::new(io::BufReader::new(file))
+        .map_err(|e| format!("Invalid zip: {e}"))?;
+    let entry = archive
+        .by_name(rel)
+        .map_err(|e| format!("File {rel} not found in zip: {e}"))?;
+    Ok(extract_snippet_lines(io::BufReader::new(entry), location, target_line))
+}
+
+fn cache_temp_zip(kind: &str) -> PathBuf {
     let dir = dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("wow-tux-forge");
@@ -1089,24 +1223,16 @@ fn cache_temp_zip(kind: &str) -> std::path::PathBuf {
     dir.join(format!("{kind}-{}.zip", std::process::id()))
 }
 
-fn install_asset_to_addons(
-    client: &reqwest::blocking::Client,
-    url: &str,
+enum InstallOutcome {
+    Installed(InstalledAddon),
+    Flagged(PendingInstall, security::AuditReport),
+}
+
+fn extract_staged_zip(
+    tmp_zip: &Path,
     addons_path: &Path,
     old_folders: &[String],
-    tmp_zip: &Path,
 ) -> Result<Vec<String>, String> {
-    github::download_to_file(client, url, tmp_zip)?;
-    let report = security::audit_zip_file(tmp_zip)?;
-    if let Some(first) = report.findings.first() {
-        return Err(format!(
-            "Blocked by security audit ({} finding(s)): {} at {}",
-            report.findings.len(),
-            first.reason,
-            first.location
-        ));
-    }
-
     // Extract to staging inside addons_path first so failed extractions never delete working addons.
     let staging = addons_path.join(format!(".wow-tux-forge-staging-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staging);
@@ -1140,6 +1266,41 @@ fn install_asset_to_addons(
     }
     let _ = std::fs::remove_dir_all(&staging);
     Ok(folders)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_and_audit_zip(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    addons_path: &Path,
+    state_key: &str,
+    tag: &str,
+    asset_name: &str,
+    old_folders: Vec<String>,
+    tmp_zip: &Path,
+) -> Result<InstallOutcome, String> {
+    github::download_to_file(client, url, tmp_zip)?;
+    let report = security::audit_zip_file(tmp_zip)?;
+    if !report.findings.is_empty() {
+        return Ok(InstallOutcome::Flagged(
+            PendingInstall {
+                state_key: state_key.to_string(),
+                tag: tag.to_string(),
+                asset_name: asset_name.to_string(),
+                tmp_zip: tmp_zip.to_path_buf(),
+                old_folders,
+            },
+            report,
+        ));
+    }
+
+    let folders = extract_staged_zip(tmp_zip, addons_path, &old_folders)?;
+    Ok(InstallOutcome::Installed(InstalledAddon {
+        tag: tag.to_string(),
+        asset_name: asset_name.to_string(),
+        folders,
+        installed_at: Some(now_unix_secs()),
+    }))
 }
 
 fn map_parallel<T: Send, R: Send>(
@@ -1756,6 +1917,17 @@ fn draw(f: &mut Frame, app: &mut App) {
                     ListItem::new(Text::from(lines))
                 })
                 .collect();
+            let modal_title = if modal.pending_install.is_some() {
+                format!(
+                    " ⚠ Security Audit: {} | {count} finding(s) — [y] Install Anyway, [Enter] View Code, [n/Esc] Cancel ",
+                    modal.title
+                )
+            } else {
+                format!(
+                    " Security Audit: {} | Threat: {threat_label} ({count} finding(s) — [Enter] View Code, [Esc] Close) ",
+                    modal.title
+                )
+            };
             let list = List::new(items)
                 .block(
                     Block::default()
@@ -1763,10 +1935,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(border_col))
                         .title(Span::styled(
-                            format!(
-                                " Security Audit: {} | Threat: {threat_label} ({count} finding(s) — [Enter] View Code, [Esc] Close) ",
-                                modal.title
-                            ),
+                            modal_title,
                             Style::default().fg(border_col).add_modifier(Modifier::BOLD),
                         )),
                 )
